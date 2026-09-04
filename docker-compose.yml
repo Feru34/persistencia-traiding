@@ -1,0 +1,134 @@
+# ===========================================================================
+# Backend de Persistencia de Trading — ARTI4109 Reto 1
+#
+#   docker compose up -d --build            postgres + api + bridge
+#   docker compose --profile engine up -d   ...y además el motor en local
+#   docker compose logs -f api
+#   docker compose down                     (añadir -v para borrar los datos)
+#
+# Contra una RDS real: pon DATABASE_URL y PGSSLMODE=require en .env y arranca
+# solo `docker compose up -d api bridge`; el servicio postgres queda sin uso.
+# ===========================================================================
+
+name: trading-persistence
+
+services:
+  # -------------------------------------------------------------------------
+  # PostgreSQL local. En AWS lo reemplaza la instancia RDS/Aurora del .env.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-trading}
+      POSTGRES_USER: ${PGUSER:-trading}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-trading}
+    ports:
+      - "${PGPORT_HOST:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-trading} -d ${PGDATABASE:-trading}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # El backend. Aplica sus migraciones al arrancar (son idempotentes).
+  # -------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trading-persistence:latest
+    container_name: trading-api
+    restart: unless-stopped
+    # tini ya va dentro de la imagen; esto añade el reaper de Docker por si
+    # se ejecuta con otro entrypoint.
+    init: true
+    env_file:
+      - .env
+    environment:
+      # Estas sobreescriben al .env DENTRO del contenedor: `localhost` allí
+      # dentro apunta al propio contenedor, no al host.
+      # Si defines DATABASE_URL en .env, tiene prioridad sobre PGHOST/PGPORT
+      # y estas dos dejan de importar — es la vía para apuntar a RDS.
+      PGHOST: ${PGHOST_DOCKER:-postgres}
+      PGPORT: ${PGPORT_DOCKER:-5432}
+      # Motor de matching. Con el perfil `engine` vale el valor por defecto;
+      # si el motor vive en otra máquina, define ENGINE_BASE_URL_DOCKER en .env
+      # (p. ej. http://10.0.1.20:8080).
+      ENGINE_BASE_URL: ${ENGINE_BASE_URL_DOCKER:-http://engine:8080}
+      NODE_ENV: ${NODE_ENV:-production}
+      HOST: 0.0.0.0
+    ports:
+      - "${PORT_HOST:-3000}:3000"
+    volumes:
+      # Los lotes que no se pudieron escribir (dead letter) sobreviven al
+      # reinicio del contenedor y se pueden reprocesar.
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    # Margen para que el apagado ordenado alcance a vaciar la cola write-behind.
+    stop_grace_period: 30s
+
+  # -------------------------------------------------------------------------
+  # Worker de Persistencia del diagrama: escucha los emparejamientos que el
+  # motor publica por WebSocket y los empuja al endpoint HTTP del backend.
+  # Va en su propio contenedor para que la caída de uno no arrastre al otro.
+  # -------------------------------------------------------------------------
+  bridge:
+    image: trading-persistence:latest
+    container_name: trading-bridge
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      BRIDGE_ENGINE_WS_URL: ${BRIDGE_ENGINE_WS_URL_DOCKER:-ws://engine:8080/api/trades/stream}
+      BRIDGE_TARGET_URL: ${BRIDGE_TARGET_URL_DOCKER:-http://api:3000/api/v1/trades}
+    command: ["node", "scripts/bridge.js"]
+    # El HEALTHCHECK de la imagen sondea el puerto 3000, que es del backend;
+    # el bridge no sirve HTTP y saldría siempre "unhealthy". Si su proceso
+    # muere, tini termina y `restart: unless-stopped` lo vuelve a levantar,
+    # así que no necesita otro chequeo.
+    healthcheck:
+      disable: true
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 15s
+
+  # -------------------------------------------------------------------------
+  # Motor de matching, solo para desarrollo local.
+  #   docker compose --profile engine up -d
+  #
+  # El JAR NO está versionado (es material del enunciado), así que se monta
+  # desde el host. En el despliegue real este nodo es una EC2 aparte.
+  # -------------------------------------------------------------------------
+  engine:
+    profiles: ["engine"]
+    # El JAR compila a bytecode de Java 17, así que un JRE 21 lo corre de sobra.
+    image: eclipse-temurin:21-jre-alpine
+    container_name: trading-engine
+    restart: unless-stopped
+    working_dir: /opt/engine
+    volumes:
+      - ./MatchineEngine.jar:/opt/engine/MatchineEngine.jar:ro
+      - ./application.properties:/opt/engine/application.properties:ro
+    command: ["java", "-jar", "MatchineEngine.jar"]
+    ports:
+      - "${ENGINE_PORT_HOST:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/api/estadisticas || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  pgdata:

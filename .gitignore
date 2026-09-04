@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Dependencias y artefactos de build
+# ---------------------------------------------------------------------------
+node_modules/
+coverage/
+dist/
+build/
+
+# ---------------------------------------------------------------------------
+# Secretos y configuración local
+# `.env.example` SÍ se versiona: es la plantilla. `.env` nunca — lleva las
+# credenciales de la RDS.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Logs y estado en disco
+# ---------------------------------------------------------------------------
+logs/
+*.log
+*.ndjson
+*.done
+
+# Bitácora y logs que escribe el motor de matching en su directorio de trabajo
+*.wal
+ordenes.log
+emparejamientos.log
+
+# ---------------------------------------------------------------------------
+# Material de referencia del reto — NO se versiona
+#
+# Son insumos del enunciado (el binario del motor, el PDF, el diagrama y la
+# configuración del motor), no código de este backend. Pesan y no aportan al
+# repositorio; cada quien los tiene en su copia local.
+# ---------------------------------------------------------------------------
+MatchineEngine.jar
+ARTI4109-reto1-matching-V2.pdf
+Diagrama Despliegue.png
+application.properties
+*.jar
+*.pdf
+
+# ---------------------------------------------------------------------------
+# Instrucciones para agentes de IA — locales, no se comparten
+# ---------------------------------------------------------------------------
+CLAUDE.md
+.claude/
+
+# ---------------------------------------------------------------------------
+# Sistema operativo y editores
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

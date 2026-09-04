@@ -1,0 +1,41 @@
+# Cuanto más pequeño el contexto de build, más rápida la imagen.
+# MatchineEngine.jar solo pesa 26 MB y no pinta nada aquí.
+
+node_modules
+npm-debug.log*
+
+.git
+.gitignore
+.github
+
+# Secretos: la configuración entra por variables de entorno, nunca horneada
+# en la imagen.
+.env
+.env.*
+
+logs
+*.log
+*.ndjson
+*.done
+*.wal
+
+# Material de referencia del reto
+MatchineEngine.jar
+*.jar
+*.pdf
+*.png
+application.properties
+
+# Documentación y herramientas que no hacen falta en tiempo de ejecución
+README.md
+CLAUDE.md
+.claude
+Dockerfile
+.dockerignore
+docker-compose*.yml
+test
+coverage
+
+.DS_Store
+.idea
+.vscode
