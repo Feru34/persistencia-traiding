@@ -5,6 +5,7 @@ import engineClient from '../services/engineClient.js';
 import sessionManager from '../services/sessionManager.js';
 import { sessionsRepo } from '../repositories/reference.repo.js';
 import reconcileService from '../services/reconcileService.js';
+import { buildStatus } from '../services/statusService.js';
 import { errorResponses } from './schemas.js';
 
 const TAG = ['Operación'];
@@ -53,6 +54,22 @@ export default async function systemRoutes(fastify) {
     const ready = checks.database === 'up';
     return reply.code(ready ? 200 : 503).send({ status: ready ? 'ready' : 'not-ready', checks });
   });
+
+  fastify.get('/status', {
+    schema: {
+      tags: TAG,
+      summary: 'Estado consolidado (para mirar, no para el balanceador)',
+      description:
+        'Una sola llamada con todo lo que hoy hay que buscar en `/ready`, `/metrics` y '
+        + 'los logs: a qué base se está conectado de verdad (host, TLS, versión, '
+        + 'migraciones aplicadas), si el motor contesta y con qué latencia, la sesión '
+        + 'activa, la cola write-behind y cuánto hay guardado.\n\n'
+        + '`overall`: `ok` | `degraded` (motor caído, cola saturada o lotes en dead-letter) '
+        + '| `down` (la base no responde). **Siempre responde 200**: es informativo. '
+        + 'El balanceador debe seguir usando `/ready`.',
+      response: { 200: freeObject },
+    },
+  }, async () => buildStatus());
 
   fastify.get('/metrics', {
     schema: {

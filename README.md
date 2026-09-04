@@ -28,6 +28,7 @@ posiciones y las comisiones.
 - [Modo `async` vs `sync`](#modo-async-vs-sync)
 - [Un hueco real: los trades se pueden perder](#un-hueco-real-los-trades-se-pueden-perder)
 - [Resultados de carga](#resultados-de-carga)
+- [Despliegue en AWS y experimento](#despliegue-en-aws-y-experimento)
 - [Operación](#operación)
 - [Pruebas](#pruebas)
 
@@ -218,6 +219,7 @@ Comprobación rápida (o abrir <http://localhost:3000/docs> y probar desde ahí)
 
 ```bash
 curl localhost:3000/api/v1/ready
+curl localhost:3000/api/v1/status     # vista consolidada: base, motor, sesión, cola
 curl -X POST localhost:3000/api/v1/orders/sell -H 'Content-Type: application/json' \
   -d '{"userId":1,"assetId":2,"price":50.25,"quantity":10}'
 curl -X POST localhost:3000/api/v1/orders/buy -H 'Content-Type: application/json' \
@@ -413,6 +415,7 @@ Prefijo: `/api/v1` — la referencia completa y probable está en [`/docs`](#doc
 |---|---|---|
 | `GET` | `/health` · `/ready` | Liveness y readiness (este último toca RDS y motor) |
 | `GET` | `/metrics` | Cola de escritura, pool de conexiones y configuración activa |
+| `GET` | `/status` | **Estado consolidado**: a qué base se está conectado (host, TLS, migraciones), motor, sesión, cola y conteos. `overall`: `ok` / `degraded` / `down`. Siempre `200`; el balanceador usa `/ready` |
 | `GET` | `/engine/stats` · `/engine/book` | Estado **en vivo** del motor |
 | `POST` | `/engine/match` | Fuerza un ciclo de emparejamiento |
 | `POST` | `/engine/reset` | Reinicia el motor **y rota la sesión** |
@@ -507,7 +510,9 @@ hay dos mitigaciones en el código:
 
 ## Resultados de carga
 
-Medido con `scripts/loadtest.js`. **Todo corriendo en un solo portátil**: el
+Medido con `scripts/loadtest.js`. **Todo corriendo en un solo portátil** (la
+medición en AWS, con el motor en su propia EC2, está en
+[EXPERIMENTO.md](EXPERIMENTO.md)): el
 backend, el motor, PostgreSQL y el generador de carga compiten por la misma
 CPU, así que los números absolutos son conservadores frente a un despliegue real.
 
@@ -555,9 +560,29 @@ ambos lados resueltos**, y la suma de cantidades de todas las posiciones igual a
 
 ---
 
+## Despliegue en AWS y experimento
+
+El backend se desplegó y midió en AWS el 2026-09-04: dos EC2 t3.micro (una para
+este backend + el bridge en Docker, otra para el motor) y una RDS PostgreSQL 18
+con TLS. Todo el detalle — topología, security groups, `.env`, protocolo de
+medición, resultados `async` vs `sync`, reconciliación y hallazgos — está en
+**[EXPERIMENTO.md](EXPERIMENTO.md)**. Resumen a 1300 órdenes/min durante 60 s:
+
+| Modo | Venta p99 (< 500 ms) | Compra p99 (< 300 ms) | Fallidas | Reconcile |
+|---|---|---|---|---|
+| `async` | **19 ms** ✅ | **19 ms** ✅ | 0 | sin discrepancias |
+| `sync` | **45 ms** ✅ | **48 ms** ✅ | 0 | sin discrepancias |
+
+Integridad: 700/700 trades con ambos lados resueltos y suma de posiciones = 0.
+
+---
+
 ## Operación
 
 ```bash
+# ¿Contra qué base estoy, contesta el motor, cómo va la cola? Todo en uno
+curl localhost:3000/api/v1/status
+
 # Estado de la cola de escritura, el pool y la configuración
 curl localhost:3000/api/v1/metrics
 
@@ -576,7 +601,8 @@ node scripts/replay-dead-letter.js
 La imagen y el compose están descritos en [Docker](#docker). El servicio aplica sus migraciones al arrancar (son idempotentes), así que en
 ECS/Fargate no hace falta un paso previo. Para el balanceador, usar
 `/api/v1/ready`: comprueba la RDS y el motor, y devuelve `503` si la base no
-responde. Un motor caído **no** marca el servicio como no disponible —- las
+responde. Para un operador, `/api/v1/status` reúne en una llamada base (host y
+TLS reales, migraciones, conteos), motor, sesión y cola. Un motor caído **no** marca el servicio como no disponible —- las
 consultas y la persistencia siguen funcionando; solo se bloquean las órdenes nuevas.
 
 Ante `SIGTERM` el apagado es ordenado: deja de recibir tráfico, vacía la cola de
