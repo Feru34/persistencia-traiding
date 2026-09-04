@@ -163,9 +163,17 @@ se asociarían a la orden equivocada. Cada ejecución del motor es una **sesión
 (`engine_sessions`), y las órdenes son únicas por `(sesión, id del motor)`.
 
 Al arrancar, el backend consulta el motor y **reanuda** la sesión anterior si el
-motor conserva su libro; solo abre una sesión nueva si el motor realmente
-empezó de cero. Además sondea el motor y rota la sesión sola si detecta que el
-contador retrocedió.
+motor conserva su libro; abre una nueva si el motor empezó de cero o si lleva
+menos órdenes procesadas que las que registra la sesión (reinició mientras el
+backend estaba caído). Además sondea el motor y rota si el contador retrocede.
+
+La detección definitiva está en el propio flujo de la orden: **si el motor
+devuelve un id que ya existe en la sesión, es que reinició su contador**, y la
+sesión rota antes de persistir. Se descubrió a la fuerza: al reiniciar el
+contenedor del motor, las órdenes nuevas recibieron ids 1, 2, 3 y el insert
+las descartó en silencio por la clave única. Ahora ese caso se distingue de un
+reenvío idempotente, se cuenta en `metrics.conflicts`, se registra en el log y
+va a dead letter — nunca desaparece sin dejar rastro.
 
 ---
 
@@ -269,23 +277,28 @@ También como scripts: `npm run docker:up`, `docker:up:engine`, `docker:logs`,
 
 ### Contra la RDS real
 
-Pon `DATABASE_URL` y `PGSSLMODE=require` en `.env` y levanta solo lo que hace
-falta:
+Pon `DATABASE_URL` en `.env` y levanta solo lo que hace falta:
 
 ```bash
 docker compose up -d --build api bridge
 ```
+
+> Con `DATABASE_URL` definido, dentro del contenedor el TLS pasa a `require`
+> automáticamente (RDS lo exige); sin él, contra el postgres del compose queda
+> en `disable`. `PGSSLMODE_DOCKER` permite forzarlo. Fuera de Docker (`npm start`)
+> se usa `PGSSLMODE` tal cual.
 
 `DATABASE_URL` tiene prioridad sobre `PGHOST`/`PGPORT`, así que el `postgres`
 del compose queda sin uso aunque exista.
 
 ### Por qué hay variables `*_DOCKER`
 
-Dentro de un contenedor `localhost` es el propio contenedor. Las variables del
-`.env` que apuntan a `localhost` (`PGHOST`, `ENGINE_BASE_URL`, las del bridge)
-no sirven ahí, así que el compose las sobreescribe con `PGHOST_DOCKER`,
+Dentro de un contenedor `localhost` es el propio contenedor, y las credenciales
+del `.env` normalmente son las de la RDS. Por eso el compose sobreescribe las
+`PG*` y las del motor con `PGHOST_DOCKER`, `PGPASSWORD_DOCKER`,
 `ENGINE_BASE_URL_DOCKER`, etc., que por defecto apuntan a los servicios del
-compose. Solo hay que definirlas cuando algo vive fuera — típicamente el motor
+compose (el postgres local es siempre `trading`/`trading`/`trading`). Así
+cambiar el `.env` para la RDS nunca rompe el stack local. Solo hay que definirlas cuando algo vive fuera — típicamente el motor
 en su EC2. El `.env.example` las documenta al final.
 
 ### Imagen suelta, sin compose

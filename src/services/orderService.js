@@ -135,12 +135,15 @@ export const orderService = {
       throw err;
     }
 
+    // El id que devuelve el motor decide la sesión: si delata un reinicio del
+    // contador, la sesión rota aquí mismo y la orden ya nace en la nueva.
+    order.engineSessionId = await sessionManager.observeEngineOrderId(engineOrderId);
     order.engineOrderId = engineOrderId;
     order.status = ORDER_STATUS.ACCEPTED;
     order.acceptedAt = new Date();
 
     const items = syncMode
-      ? [{ type: ITEM.ACCEPTED, payload: { orderId: order.id, engineOrderId } }]
+      ? [{ type: ITEM.ACCEPTED, payload: { orderId: order.id, engineOrderId, engineSessionId: order.engineSessionId } }]
       : [{ type: ITEM.ORDER, payload: order }];
 
     const ok = await persistence.submit(items);

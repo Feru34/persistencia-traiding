@@ -21,13 +21,57 @@ export const ordersRepo = {
    * idempotente: reprocesar un lote tras un fallo no duplica filas.
    */
   async insertMany(client, orders) {
-    if (orders.length === 0) return 0;
+    if (orders.length === 0) return { inserted: 0, replayed: 0, conflicts: [] };
     const sql = `
       INSERT INTO orders (${COLUMNS.join(', ')})
       VALUES ${valuesClause(orders.length, COLUMNS.length)}
-      ON CONFLICT DO NOTHING`;
+      ON CONFLICT DO NOTHING
+      RETURNING id`;
     const res = await client.query(sql, flatten(orders.map(toRow)));
-    return res.rowCount;
+    const inserted = new Set(res.rows.map((r) => r.id));
+    const missing = orders.filter((o) => !inserted.has(o.id));
+    if (missing.length === 0) return { inserted: inserted.size, replayed: 0, conflicts: [] };
+
+    // `ON CONFLICT DO NOTHING` sin destino traga CUALQUIER violación de
+    // unicidad, y hay dos muy distintas: el mismo `id` (un reenvío del lote,
+    // benigno e intencional) y el mismo (sesión, engine_order_id) (el motor
+    // reinició su contador y NO se rotó la sesión: una orden distinta que se
+    // perdería sin dejar rastro). Se separan aquí para que la segunda nunca
+    // pase desapercibida.
+    const { rows } = await client.query(
+      'SELECT id FROM orders WHERE id = ANY($1::uuid[])',
+      [missing.map((o) => o.id)],
+    );
+    const replayed = new Set(rows.map((r) => r.id));
+    const conflicts = missing.filter((o) => !replayed.has(o.id));
+    return { inserted: inserted.size, replayed: replayed.size, conflicts };
+  },
+
+  /** ¿Ya se registró este id del motor en la sesión? Señal de reinicio del motor. */
+  async engineIdExists(sessionId, engineOrderId) {
+    const { rows } = await pool.query(
+      'SELECT 1 FROM orders WHERE engine_session_id = $1 AND engine_order_id = $2 LIMIT 1',
+      [sessionId, engineOrderId],
+    );
+    return rows.length > 0;
+  },
+
+  /** Órdenes que el motor aceptó en una sesión. Cota inferior de lo que el motor debió procesar. */
+  async countInSession(sessionId) {
+    const { rows } = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM orders WHERE engine_session_id = $1 AND engine_order_id IS NOT NULL',
+      [sessionId],
+    );
+    return Number(rows[0].n);
+  },
+
+  /** Mayor id del motor registrado en una sesión (para reanudar sin perder el hilo). */
+  async maxEngineOrderId(sessionId) {
+    const { rows } = await pool.query(
+      'SELECT COALESCE(MAX(engine_order_id), 0) AS max FROM orders WHERE engine_session_id = $1',
+      [sessionId],
+    );
+    return Number(rows[0].max);
   },
 
   /**
@@ -101,12 +145,15 @@ export const ordersRepo = {
     const sql = `
       UPDATE orders o
       SET engine_order_id = v.engine_order_id,
+          -- Si el motor reinició entre el INSERT (PENDING) y esta confirmación,
+          -- la orden pertenece a la sesión nueva, no a la que tenía la fila.
+          engine_session_id = COALESCE(v.session_id, o.engine_session_id),
           status = CASE WHEN o.status = 'PENDING' THEN 'ACCEPTED'::order_status ELSE o.status END,
           accepted_at = COALESCE(o.accepted_at, now()),
           updated_at = now()
-      FROM (VALUES ${valuesClause(items.length, 2, 1, ['uuid', 'bigint'])}) AS v(order_id, engine_order_id)
+      FROM (VALUES ${valuesClause(items.length, 3, 1, ['uuid', 'bigint', 'uuid'])}) AS v(order_id, engine_order_id, session_id)
       WHERE o.id = v.order_id`;
-    const res = await client.query(sql, flatten(items.map((i) => [i.orderId, i.engineOrderId])));
+    const res = await client.query(sql, flatten(items.map((i) => [i.orderId, i.engineOrderId, i.engineSessionId ?? null])));
     return res.rowCount;
   },
 

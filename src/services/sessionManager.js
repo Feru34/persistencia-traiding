@@ -3,6 +3,7 @@ import { withTransaction } from '../db/pool.js';
 import { sessionsRepo } from '../repositories/reference.repo.js';
 import { uuidv7 } from '../domain/uuid.js';
 import engineClient from './engineClient.js';
+import ordersRepo from '../repositories/orders.repo.js';
 
 /**
  * El motor reinicia su contador de IDs de orden en 1 cada vez que arranca o
@@ -15,6 +16,14 @@ class SessionManager {
     this.sessionId = null;
     this.startedAt = null;
     this.lastProcessed = -1;
+    // Mayor id de orden que el motor ha devuelto en la sesión actual. Es el
+    // detector de reinicios más fino que existe: el contador del motor es
+    // monótono mientras viva la JVM, así que un id ya visto solo puede
+    // significar que volvió a empezar desde 1.
+    this.maxEngineOrderId = 0;
+    // Promesa de la rotación en curso: N peticiones concurrentes que detecten
+    // el reinicio a la vez deben esperar UNA rotación, no abrir N sesiones.
+    this.rotating = null;
     this.poller = null;
     this.logger = console;
   }
@@ -47,43 +56,100 @@ class SessionManager {
 
     if (stats === null) {
       if (open) {
-        this.#resume(open, 'motor inaccesible al arrancar; se conserva la sesión');
+        await this.#resume(open, 'motor inaccesible al arrancar; se conserva la sesión');
       } else {
         await this.rotate('arranque del backend sin sesión previa');
       }
     } else {
       const processed = Number(stats.ordenesProcesadasTotales ?? 0);
       const enBooks = Number(stats.ordenesEnCompra ?? 0) + Number(stats.ordenesEnVenta ?? 0);
-      if (open && (processed > 0 || enBooks > 0)) {
-        // El motor sigue siendo el mismo de la sesión anterior.
-        this.#resume(open, 'se reanuda la sesión: el motor conserva su libro');
-        this.lastProcessed = processed;
+      // Toda orden que registramos con id del motor fue aceptada por él, así
+      // que un motor que siga siendo la misma JVM ha procesado AL MENOS esas.
+      // Si lleva menos, reinició mientras este backend estaba caído.
+      const recorded = open ? await ordersRepo.countInSession(open.id) : 0;
+      if (open && (processed > 0 || enBooks > 0) && processed >= recorded) {
+        await this.#resume(open, 'se reanuda la sesión: el motor conserva su libro');
       } else {
-        await this.rotate(processed === 0 ? 'motor recién iniciado' : 'arranque del backend');
-        this.lastProcessed = processed;
+        let reason = 'arranque del backend';
+        if (processed === 0 && enBooks === 0) reason = 'motor recién iniciado';
+        else if (open && processed < recorded) {
+          reason = `el motor lleva ${processed} órdenes procesadas y la sesión registra ${recorded}: reinició mientras el backend estaba caído`;
+        }
+        await this.rotate(reason);
       }
+      this.lastProcessed = processed;
     }
 
     this.startPolling();
   }
 
-  #resume(session, reason) {
+  async #resume(session, reason) {
     this.sessionId = session.id;
     this.startedAt = session.started_at;
-    this.logger.info?.({ sessionId: session.id, reason }, '[session] sesión reanudada');
+    this.maxEngineOrderId = await ordersRepo.maxEngineOrderId(session.id);
+    this.logger.info?.(
+      { sessionId: session.id, reason, maxEngineOrderId: this.maxEngineOrderId },
+      '[session] sesión reanudada',
+    );
   }
 
   async rotate(reason) {
-    const id = uuidv7();
-    await withTransaction(async (client) => {
-      await sessionsRepo.closeOpenSessions(client);
-      await sessionsRepo.open(client, { id, reason, engineUrl: config.engine.baseUrl });
-    });
-    this.sessionId = id;
-    this.startedAt = new Date();
-    this.lastProcessed = -1;
-    this.logger.info?.({ sessionId: id, reason }, '[session] nueva sesión de motor');
-    return id;
+    if (this.rotating) return this.rotating;
+    this.rotating = (async () => {
+      const id = uuidv7();
+      await withTransaction(async (client) => {
+        await sessionsRepo.closeOpenSessions(client);
+        await sessionsRepo.open(client, { id, reason, engineUrl: config.engine.baseUrl });
+      });
+      this.sessionId = id;
+      this.startedAt = new Date();
+      this.lastProcessed = -1;
+      this.maxEngineOrderId = 0;
+      this.logger.info?.({ sessionId: id, reason }, '[session] nueva sesión de motor');
+      return id;
+    })().finally(() => { this.rotating = null; });
+    return this.rotating;
+  }
+
+  /**
+   * Se llama con cada id que devuelve el motor, ANTES de persistir la orden.
+   * Devuelve la sesión a la que pertenece esa orden — la actual, o una nueva
+   * si el id delata que el motor reinició su contador.
+   *
+   * Un id menor o igual que el máximo visto tiene dos causas posibles: dos
+   * peticiones concurrentes cuyas respuestas llegaron desordenadas (inofensivo)
+   * o un reinicio del motor. Lo decide la base: si ese id ya está registrado
+   * en la sesión, es un reinicio. El desorden concurrente nunca repite un id.
+   */
+  async observeEngineOrderId(engineOrderId) {
+    if (this.rotating) await this.rotating;
+    if (engineOrderId > this.maxEngineOrderId) {
+      this.maxEngineOrderId = engineOrderId;
+      return this.sessionId;
+    }
+    // Sospecha. Dos confirmaciones exactas, sin heurísticas:
+    //  1) el id ya está registrado en la sesión -> reinicio seguro;
+    //  2) si no está (la sesión es joven y no había llegado a ese id), el
+    //     contador acumulado del motor retrocedió respecto al último sondeo
+    //     -> reinicio seguro. Un desorden concurrente nunca lo hace retroceder.
+    let reason = null;
+    if (await ordersRepo.engineIdExists(this.sessionId, engineOrderId)) {
+      reason = 'reinicio del motor detectado: id de orden repetido en la sesión';
+    } else if (this.lastProcessed >= 0) {
+      try {
+        const processed = Number((await engineClient.getStats()).ordenesProcesadasTotales ?? 0);
+        if (processed < this.lastProcessed) {
+          reason = `reinicio del motor detectado: el contador de procesadas retrocedió (${this.lastProcessed} -> ${processed})`;
+        }
+      } catch {
+        // Sin motor no se puede confirmar; se asume desorden concurrente.
+      }
+    }
+    if (!reason) return this.sessionId;
+    this.logger.warn?.({ engineOrderId, maxSeen: this.maxEngineOrderId }, `[session] ${reason}; rotando`);
+    await this.rotate(reason);
+    this.maxEngineOrderId = Math.max(this.maxEngineOrderId, engineOrderId);
+    return this.sessionId;
   }
 
   /**

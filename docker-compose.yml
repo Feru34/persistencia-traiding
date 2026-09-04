@@ -20,16 +20,19 @@ services:
     image: postgres:16-alpine
     container_name: trading-postgres
     restart: unless-stopped
+    # Credenciales FIJAS a propósito: el .env suele llevar las de la RDS, y si
+    # se reutilizaran aquí, cambiar el .env rompería el stack local (la
+    # contraseña de un volumen ya inicializado no cambia con la variable).
     environment:
-      POSTGRES_DB: ${PGDATABASE:-trading}
-      POSTGRES_USER: ${PGUSER:-trading}
-      POSTGRES_PASSWORD: ${PGPASSWORD:-trading}
+      POSTGRES_DB: trading
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading
     ports:
       - "${PGPORT_HOST:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-trading} -d ${PGDATABASE:-trading}"]
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -51,12 +54,21 @@ services:
     env_file:
       - .env
     environment:
-      # Estas sobreescriben al .env DENTRO del contenedor: `localhost` allí
-      # dentro apunta al propio contenedor, no al host.
-      # Si defines DATABASE_URL en .env, tiene prioridad sobre PGHOST/PGPORT
-      # y estas dos dejan de importar — es la vía para apuntar a RDS.
+      # Estas sobreescriben al .env DENTRO del contenedor y apuntan al
+      # postgres de este compose: `localhost` allí dentro es el propio
+      # contenedor, y las credenciales del .env suelen ser las de la RDS.
+      # Para apuntar a RDS desde Docker: DATABASE_URL en .env (tiene prioridad
+      # sobre todas las PG*) + PGSSLMODE_DOCKER=require.
       PGHOST: ${PGHOST_DOCKER:-postgres}
       PGPORT: ${PGPORT_DOCKER:-5432}
+      PGDATABASE: ${PGDATABASE_DOCKER:-trading}
+      PGUSER: ${PGUSER_DOCKER:-trading}
+      PGPASSWORD: ${PGPASSWORD_DOCKER:-trading}
+      # TLS dentro del contenedor. Regla: PGSSLMODE_DOCKER si está definida;
+      # si no, `require` cuando hay DATABASE_URL (es decir, RDS, que rechaza
+      # conexiones sin TLS) y `disable` contra el postgres del compose, que no
+      # tiene TLS. Así apuntar a RDS nunca falla por olvidar esta variable.
+      PGSSLMODE: ${PGSSLMODE_DOCKER:-${DATABASE_URL:+require}}
       # Motor de matching. Con el perfil `engine` vale el valor por defecto;
       # si el motor vive en otra máquina, define ENGINE_BASE_URL_DOCKER en .env
       # (p. ej. http://10.0.1.20:8080).
@@ -82,6 +94,13 @@ services:
   # Va en su propio contenedor para que la caída de uno no arrastre al otro.
   # -------------------------------------------------------------------------
   bridge:
+    # Misma imagen que `api`. Lleva su propio `build` porque, si solo se
+    # referencia por nombre, Compose intenta DESCARGARLA de Docker Hub antes
+    # de que `api` la construya y muestra "pull access denied". Con la caché
+    # de BuildKit la segunda construcción es instantánea.
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: trading-persistence:latest
     container_name: trading-bridge
     restart: unless-stopped

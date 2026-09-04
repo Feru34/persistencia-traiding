@@ -13,6 +13,15 @@ try {
     { host: config.db.connectionString ? '(DATABASE_URL)' : `${config.db.host}:${config.db.port}` },
     'conectado a PostgreSQL',
   );
+  // Dentro de docker compose el host `postgres` es el PostgreSQL local del
+  // compose. Las variables PG* sueltas del .env NO llegan al contenedor; la
+  // RDS solo se alcanza con DATABASE_URL. Sin este aviso se puede medir
+  // contra la base equivocada sin notarlo.
+  if (!config.db.connectionString && config.db.host === 'postgres') {
+    app.log.warn(
+      'usando el PostgreSQL LOCAL del compose, no una RDS. Para apuntar a RDS define DATABASE_URL en el .env',
+    );
+  }
 
   // Idempotente: aplica solo lo que falte. Cómodo en ECS/Fargate, donde el
   // contenedor arranca sin un paso de migración aparte.

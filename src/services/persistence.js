@@ -38,7 +38,7 @@ export async function applyBatch(client, items) {
     else if (item.type === ITEM.TRADE) trades.push(item.payload);
   }
 
-  const stats = { orders: 0, accepted: 0, rejected: 0, trades: 0, duplicates: 0, fills: 0, positions: 0 };
+  const stats = { orders: 0, replayed: 0, orderConflicts: [], accepted: 0, rejected: 0, trades: 0, duplicates: 0, fills: 0, positions: 0 };
 
   // 1. Usuarios (FK de orders). Alta idempotente.
   if (config.business.autoCreateUsers && orders.length > 0) {
@@ -47,7 +47,12 @@ export async function applyBatch(client, items) {
   }
 
   // 2. Órdenes
-  if (orders.length > 0) stats.orders = await ordersRepo.insertMany(client, orders);
+  if (orders.length > 0) {
+    const r = await ordersRepo.insertMany(client, orders);
+    stats.orders = r.inserted;
+    stats.replayed = r.replayed;
+    stats.orderConflicts = r.conflicts;
+  }
   if (accepted.length > 0) stats.accepted = await ordersRepo.markAccepted(client, accepted);
   if (rejected.length > 0) stats.rejected = await ordersRepo.markRejected(client, rejected);
 
@@ -154,7 +159,7 @@ export class BatchWriter {
     this.closed = false;
     this.metrics = {
       enqueued: 0, dropped: 0, flushed: 0, duplicates: 0,
-      batches: 0, failures: 0, deadLettered: 0,
+      batches: 0, failures: 0, deadLettered: 0, conflicts: 0,
       queueDepth: 0, maxQueueDepth: 0, lastFlushMs: 0, lastFlushAt: null,
     };
   }
@@ -214,6 +219,7 @@ export class BatchWriter {
     for (let attempt = 0; attempt <= config.persist.retryAttempts; attempt += 1) {
       try {
         const stats = await withTransaction((client) => applyBatch(client, batch));
+        await this.reportConflicts(stats);
         this.metrics.batches += 1;
         this.metrics.flushed += batch.length;
         this.metrics.duplicates += stats.duplicates;
@@ -233,6 +239,25 @@ export class BatchWriter {
         await sleep(config.persist.retryDelayMs * 2 ** attempt);
       }
     }
+  }
+
+  /**
+   * Órdenes descartadas por colisión de (sesión, engine_order_id). No es un
+   * fallo de la base — la transacción confirmó — así que sin esto pasarían por
+   * escritas. Se cuentan, se registran y van a dead letter con su motivo.
+   */
+  async reportConflicts(stats) {
+    const conflicts = stats?.orderConflicts ?? [];
+    if (conflicts.length === 0) return;
+    this.metrics.conflicts += conflicts.length;
+    this.logger.error?.(
+      { orders: conflicts.map((o) => ({ id: o.id, engineOrderId: o.engineOrderId, session: o.engineSessionId })) },
+      '[batch] órdenes descartadas: (sesión, id del motor) ya existía. ¿Reinició el motor sin rotar la sesión?',
+    );
+    await this.#deadLetter(
+      conflicts.map((o) => ({ type: ITEM.ORDER, payload: o })),
+      new Error('conflicto (engine_session_id, engine_order_id): el motor reinició su contador sin rotar la sesión'),
+    );
   }
 
   /** Un lote irrecuperable se vuelca a disco en NDJSON para poder reprocesarlo. */
@@ -272,7 +297,8 @@ export const persistence = {
   async submit(items) {
     if (items.length === 0) return true;
     if (config.persist.mode === 'async') return batchWriter.enqueue(items);
-    await withTransaction((client) => applyBatch(client, items));
+    const stats = await withTransaction((client) => applyBatch(client, items));
+    await batchWriter.reportConflicts(stats);
     return true;
   },
 
