@@ -39,7 +39,7 @@ y *cuánto tarda*:
                                     EC2 motor (t3.micro, us-east-1b)
                                     priv 172.31.21.117 · Corretto 21 · MatchineEngine.jar
 
-  EC2 persistencia ──TLS 5432──▶ RDS PostgreSQL 18.3 (db.t3.micro, us-east-1f)
+  EC2 persistencia ──TLS 5432──▶ RDS PostgreSQL 18.3 (db.t4g.micro, us-east-1f)
                                  priv 172.31.70.209 · base `trading`
 ```
 

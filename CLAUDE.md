@@ -15,6 +15,7 @@ que el tema no pertenece a otra:
 | [README.md](README.md) | El proyecto: decisiones de diseño, arquitectura, contrato del motor, API, modelo de datos, Docker, variables | Nada específico de AWS ni resultados de medición |
 | [INFRA.md](INFRA.md) | AWS: instancias, IPs, Security Groups, arranque automático, operación remota, balanceador (NLB + CloudFormation), costos, desmontaje | Detalles de la API o del dominio |
 | [EXPERIMENTO.md](EXPERIMENTO.md) | La medición: objetivo, protocolo, resultados, hallazgos, límites | Instrucciones de montaje (van en INFRA.md) |
+| [PILOTO.md](PILOTO.md) | Guía operativa paso a paso para correr el piloto del NLB a mano desde un Mac y guardar la evidencia | Explicaciones de diseño (README) o de infraestructura (INFRA) |
 | [PENDIENTES.md](PENDIENTES.md) | Traspaso de contexto y tareas abiertas | Documentación estable |
 | `infra/` | Plantillas de IaC (CloudFormation) | |
 

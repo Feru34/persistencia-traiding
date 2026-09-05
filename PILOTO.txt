@@ -1,0 +1,551 @@
+=====================================================================
+PILOTO DEL BALANCEADOR (NLB) - GUIA MANUAL PASO A PASO DESDE UN MAC
+Backend de Persistencia de Trading - ARTI4109 Reto 1
+=====================================================================
+
+Todo lo que sigue es manual, con los comandos listos para copiar. Es un
+piloto corto de unos 10 minutos por variante, con el generador de carga
+que ya existe. La misma guia esta en el repo como PILOTO.md y como pagina:
+https://claude.ai/code/artifact/b0080927-d267-4bab-9430-8a7969cbe5c4
+
+Donde se ejecuta cada cosa:
+  [MAC]  en tu portatil, en una terminal con el perfil arquisoft activo
+  [EC2]  dentro de una instancia, entrando por SSH
+
+
+---------------------------------------------------------------------
+0. QUE HAY MONTADO (cuenta AWS 660360494821, region us-east-1 Virginia)
+---------------------------------------------------------------------
+
+  Pieza                          Id                     IP privada (fija)
+  EC2 persistencia original      i-066240bbc580e697d    172.31.84.127
+  EC2 replica de persistencia    i-0355dc1e06f770749    172.31.86.199
+  EC2 generador de carga         i-0517df006919e40f1    172.31.88.252
+  EC2 motor de emparejamiento    i-03d62904b8f2f5b48    172.31.21.117
+  RDS PostgreSQL 18.3            arquisoft-bbdd         172.31.70.209
+    (db.t4g.micro, us-east-1f, subnet-07e9d911ee10df2a2, no la borra el stack)
+
+  Balanceador NLB (DNS fijo mientras exista el stack):
+    http://trading-nlb-3873526197343ac2.elb.us-east-1.amazonaws.com
+  Target group:
+    arn:aws:elasticloadbalancing:us-east-1:660360494821:targetgroup/trading-tg-80/d7601f5555d27d04
+  Stack de CloudFormation: trading-nlb
+  Par de llaves SSH: Arquisoft (archivo Arquisoft.pem)
+
+  !! EL NLB ES INTERNO (Scheme: internal en la plantilla). Su DNS SOLO se
+  !! resuelve y se alcanza DESDE DENTRO DE LA VPC. Desde el Mac no responde,
+  !! y eso NO es una averia: es el motivo de que la carga se lance desde la
+  !! EC2 generadora. Es interno a proposito, porque un NLB internet-facing
+  !! asigna una IPv4 publica por AZ y cada una se factura por hora.
+
+  Que se lleva el "delete-stack" del paso 11: NLB, listener, target group,
+  replica y generador. NO se lleva la EC2 original, ni el motor, ni la RDS,
+  ni la AMI con su snapshot (esa hay que borrarla a mano).
+
+  IPs publicas VIGENTES (comprobadas contra AWS el 2026-09-05, con las
+  cuatro instancias "running" y sin apagarse desde entonces):
+    original   34.226.139.255    (encendida 13:01 UTC)
+    replica    44.201.252.165    (encendida 15:51 UTC)
+    generador  54.159.150.22     (encendida 15:51 UTC)
+    motor      54.227.51.136     (encendida 13:01 UTC)
+
+  !! LAS IPs PUBLICAS CAMBIAN CADA VEZ QUE UNA INSTANCIA SE APAGA Y SE
+  !! ENCIENDE. Las privadas no. Mientras nadie apague nada, las de arriba
+  !! sirven; en cuanto haya un apagon, consultarlas con el comando del paso 2.
+
+  Todo lo de este bloque esta verificado contra la cuenta real el 2026-09-05
+  (aws ec2 describe-instances, aws elbv2 describe-load-balancers /
+  describe-target-groups / describe-target-health, aws rds
+  describe-db-instances, aws cloudformation describe-stacks):
+    - los cuatro instance-id, las cuatro IPs privadas y las cuatro publicas
+    - el DNS del NLB, su Scheme "internal" y su estado "active"
+    - el ARN del target group, su health check (/api/v1/ready, cada 10 s,
+      umbral 2) y sus DOS targets en "healthy"
+    - el stack trading-nlb en CREATE_COMPLETE
+
+
+---------------------------------------------------------------------
+1. PREPARAR EL MAC (una sola vez)                                [MAC]
+---------------------------------------------------------------------
+
+1.1 Instalar la CLI de AWS
+
+    brew install awscli
+    aws --version
+
+  Sin Homebrew: descargar el instalador .pkg desde https://aws.amazon.com/cli/
+
+1.2 Configurar el perfil "arquisoft" SIN tocar otros perfiles
+
+  La CLI guarda varias cuentas en "perfiles". Si el Mac ya tiene la CLI
+  configurada para la empresa (perfil default), NO se toca: se crea un
+  perfil aparte con nombre y se activa solo en la terminal donde se trabaja.
+
+  Primero hacen falta claves de acceso de la cuenta de Arquisoft:
+    consola AWS -> IAM -> Users -> tu usuario -> Security credentials
+    -> Create access key -> Command Line Interface (CLI)
+  Se muestran una sola vez.
+
+    aws configure --profile arquisoft
+      AWS Access Key ID:      (la clave creada)
+      AWS Secret Access Key:  (el secreto)
+      Default region name:    us-east-1
+      Default output format:  json
+
+  Comprobar que responde con la cuenta correcta (660360494821):
+
+    aws sts get-caller-identity --profile arquisoft
+
+  En CADA terminal nueva donde trabajes con este proyecto, activa el
+  perfil una vez y ya no hace falta escribir --profile:
+
+    export AWS_PROFILE=arquisoft
+
+  Al cerrar la terminal la CLI vuelve al perfil de la empresa.
+  Las claves nunca se pegan en un chat, ni se suben al repo, ni se
+  comparten por mensaje.
+
+1.3 La llave SSH
+
+  Copiar Arquisoft.pem a ~/.ssh/ y restringir permisos (si no, ssh se
+  niega a usarla):
+
+    chmod 400 ~/.ssh/Arquisoft.pem
+
+1.4 Clonar el repositorio -- SOLO para guardar la evidencia (paso 9)
+
+  El piloto NO se corre desde el Mac. Todo pasa en la nube: la carga la
+  lanza la EC2 generadora, que ya trae el repo y la imagen Docker dentro de
+  la AMI. Los pasos 2 a 8 no tocan este clon para nada, y el Mac solo hace
+  de terminal (ssh) y de mando a distancia de AWS (aws cli).
+
+  Entonces, para que clonar? Por una sola razon: LA EC2 GENERADORA Y LA
+  REPLICA SON DESECHABLES. Estan dentro del stack de CloudFormation, y
+  "delete-stack" borra sus discos con todo lo que hayan producido. La
+  evidencia tiene que aterrizar en una maquina que sobreviva y desde la que
+  se pueda hacer git push. El Mac es esa maquina.
+
+  Se puede dejar para el paso 9; no es un requisito para empezar a medir.
+
+    git clone <url-del-repo> ~/Perssitencia-trading
+    cd ~/Perssitencia-trading
+
+  Alternativas, si no quieres clonar en el Mac:
+    - Bajar los resultados con scp a cualquier carpeta y subirlos a mano.
+    - Copiarlos a la EC2 de persistencia ORIGINAL, que no esta en el stack
+      y por tanto sobrevive al delete-stack (el repo vive alli en
+      ~/persistencia-traiding). Pero esa maquina no tiene credenciales de
+      git push, asi que habria que empujar desde otro sitio igualmente.
+  Lo que NO vale: dejar la unica copia en el generador o en la replica.
+
+
+---------------------------------------------------------------------
+2. ENCENDER Y COMPROBAR                                          [MAC]
+---------------------------------------------------------------------
+
+  A 2026-09-05 las cuatro instancias YA ESTAN ENCENDIDAS y los dos targets
+  del balanceador ya salen "healthy": si nadie ha apagado nada desde
+  entonces, este paso entero se salta y se va directo al paso 3. Los
+  comandos de abajo son para volver a empezar tras un apagon.
+
+    export AWS_PROFILE=arquisoft
+
+    # encender las cuatro instancias (si ya estan encendidas no pasa nada)
+    aws ec2 start-instances --instance-ids i-03d62904b8f2f5b48 i-066240bbc580e697d i-0355dc1e06f770749 i-0517df006919e40f1
+
+    # esperar ~1 minuto y sacar las IPs publicas de hoy
+    aws ec2 describe-instances \
+      --instance-ids i-03d62904b8f2f5b48 i-066240bbc580e697d i-0355dc1e06f770749 i-0517df006919e40f1 \
+      --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,State.Name,PublicIpAddress,PrivateIpAddress]' --output table
+
+    # las dos instancias del balanceador deben decir "healthy"
+    aws elbv2 describe-target-health \
+      --target-group-arn arn:aws:elasticloadbalancing:us-east-1:660360494821:targetgroup/trading-tg-80/d7601f5555d27d04 \
+      --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State]' --output table
+
+    # monitoreo detallado de CloudWatch (1 min en vez de 5), solo durante la sesion
+    aws ec2 monitor-instances --instance-ids i-03d62904b8f2f5b48 i-066240bbc580e697d i-0355dc1e06f770749
+
+  Si un target sale "unhealthy" tras encender, espera un minuto mas. El
+  balanceador consulta GET /api/v1/ready cada 10 segundos y necesita DOS
+  respuestas buenas seguidas para marcar "healthy", asi que en el mejor de
+  los casos tarda ~20 s desde que la API levanta; y /ready no responde 200
+  hasta que la RDS y el motor contestan.
+
+
+---------------------------------------------------------------------
+3. ENTRAR AL GENERADOR Y COMPROBAR LA SESION DEL MOTOR     [EC2 generador]
+---------------------------------------------------------------------
+
+    ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-GENERADOR>
+
+    curl -s http://172.31.84.127/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+    curl -s http://172.31.86.199/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+
+  LOS DOS IDS DEBEN SER IGUALES. Si no lo son, no midas: los trades de una
+  instancia no resolverian las ordenes de la otra. Arreglo: manda una orden
+  por cualquiera de las dos y reinicia la API de la otra. Espera 30 s y
+  vuelve a comparar.
+
+    curl -s -X POST http://172.31.86.199/api/v1/orders/sell -H 'Content-Type: application/json' \
+      -d '{"userId":1,"assetId":2,"price":999,"quantity":1}'
+
+    # en otra terminal del Mac, contra la EC2 original:
+    ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-ORIGINAL> 'cd persistencia-traiding && docker compose restart api'
+
+  ESTADO REAL COMPROBADO EL 2026-09-05 (hay que arreglarlo antes de medir):
+
+      original  session.id  01a07273-5682-71be-879a-045b9b077ba1
+      replica   session.id  01a07273-5475-7e4c-ae91-03ad3984486d
+
+  SON DISTINTOS. Y el motor esta en frio, que es justo la causa:
+
+      curl -s http://172.31.21.117:8080/api/estadisticas
+      {"ordenesEnCompra":0,"ordenesEnVenta":0,"tradesEmparejados":0,
+       "ultimaOrdenRecibida":0,"ordenesProcesadasTotales":0}
+
+  O sea: hoy el piloto NO se puede medir tal cual esta. Primero el arreglo
+  de arriba (la orden + el reinicio), y no seguir hasta que los dos ids
+  coincidan.
+
+  Por que funciona: al arrancar, un backend reanuda la sesion abierta en la
+  RDS solo si comprueba que el motor conserva su libro. Con el motor recien
+  encendido (cero ordenes procesadas) no puede distinguirlo de un reinicio y
+  abre una sesion nueva, cerrando la del otro. La orden de arriba deja de ser
+  cero; el reinicio hace que el otro reanude. La logica esta en
+  src/services/sessionManager.js.
+
+
+---------------------------------------------------------------------
+3 BIS. LOS DOS FORMATOS JSON (leer antes de escribir cualquier curl)
+---------------------------------------------------------------------
+
+  Hay DOS contratos JSON distintos, en dos capas distintas. Se confunden a
+  menudo porque los dos describen "una orden".
+
+  (1) CLIENTE -> API DE PERSISTENCIA        puerto 80,  /api/v1/orders/...
+      Campos en INGLES. El lado (compra o venta) va en la RUTA, no en el
+      cuerpo. Es el formato del curl del paso 3 y el que usa el loadtest.
+
+        POST /api/v1/orders/buy       (o /api/v1/orders/sell)
+        {"userId":1,"assetId":2,"price":999,"quantity":1}
+
+          userId         entero >= 0
+          assetId        entero de 0 a 4 (el motor solo admite cinco activos)
+          price          decimal > 0, maximo 2 decimales
+          quantity       entero >= 1
+          clientOrderId  opcional; reenviar con el mismo id devuelve la
+                         orden original (200) en vez de duplicarla
+
+      Tambien existe POST /api/v1/orders con "side":"BUY"|"SELL" en el cuerpo.
+      El esquema es estricto (additionalProperties:false): mandarle
+      "idUsuario" o "tipo" a ESTA API devuelve 400 ValidationError.
+
+  (2) PERSISTENCIA -> MATCHINEENGINE        puerto 8080, /api/ordenes
+      Campos en ESPANOL, con "tipo". EN EL PILOTO NADIE ESCRIBE ESTE JSON A
+      MANO: lo construye el backend. Aparece aqui solo para reconocerlo.
+
+        POST /api/ordenes
+        {"idUsuario":42,"idActivo":2,"tipo":0,"precio":105.5,"cantidad":500}
+
+          tipo 0 = COMPRA, tipo 1 = VENTA
+          El motor responde el id de la orden en TEXTO PLANO (".. ID: 17"),
+          no en JSON.
+
+  La traduccion, tal como la hace src/services/orderService.js:
+
+        userId         ->  idUsuario
+        assetId        ->  idActivo
+        ruta buy/sell  ->  tipo (0 / 1)
+        price          ->  precio      (decimal, NO centavos)
+        quantity       ->  cantidad
+
+  Los centavos (BIGINT) son solo la representacion interna de la base de
+  datos. Ni la API publica ni el motor los ven.
+
+  Regla practica: si la URL lleva /api/v1/ es formato ingles; si lleva
+  :8080/api/ es formato espanol.
+
+
+---------------------------------------------------------------------
+4. PREPARAR LA CARPETA DE LA CORRIDA Y EL MUESTREO        [EC2 generador]
+---------------------------------------------------------------------
+
+  Todo lo que produzca la corrida va a una carpeta con fecha. Un bucle en
+  segundo plano guarda cada 5 segundos las metricas de los dos backends
+  (cola write-behind, conflictos, conteos) y las estadisticas del motor.
+
+    RUN=~/results/piloto-$(date +%F-%H%M); mkdir -p $RUN; cd $RUN
+    NLB=http://trading-nlb-3873526197343ac2.elb.us-east-1.amazonaws.com
+
+    ( while true; do
+        T=$(date -u +%FT%TZ)
+        echo "{\"t\":\"$T\",\"node\":\"original\",\"m\":$(curl -s http://172.31.84.127/api/v1/metrics)}"
+        echo "{\"t\":\"$T\",\"node\":\"replica\",\"m\":$(curl -s http://172.31.86.199/api/v1/metrics)}"
+        echo "{\"t\":\"$T\",\"node\":\"motor\",\"m\":$(curl -s http://172.31.21.117:8080/api/estadisticas)}"
+        sleep 5
+      done ) > metrics.ndjson &
+    echo $! > muestreo.pid
+
+  Las metricas de /api/v1/metrics son LOCALES de cada instancia: la cola
+  write-behind, los contadores y el dead-letter no se comparten. Para el
+  informe hay que SUMAR las dos, no leer una sola. Por eso el muestreo
+  consulta las dos por su IP privada, nunca a traves del NLB.
+
+  Contadores utiles de cada instancia: "enqueued" (items encolados, es el
+  proxy del trabajo que le toco), "queueDepth" y "maxQueueDepth" (cuanto se
+  acumulo), "saturated" (backpressure activo), "dropped" y "deadLettered"
+  (lo que se perdio), "conflicts" (reenvios ignorados).
+
+  Las terminales de los pasos 4, 6 y 7 deben ser LA MISMA, o $RUN y $NLB
+  no estaran definidos. Si abres una nueva: cd al directorio y vuelve a
+  exportar las dos variables.
+
+
+---------------------------------------------------------------------
+5. CPU DE CADA MAQUINA (tres terminales mas)   [EC2 original, replica, motor]
+---------------------------------------------------------------------
+
+  Una terminal por instancia, con la misma llave y la IP publica de cada
+  una. Se lanza JUSTO ANTES de la carga; 300 segundos cubren las tres
+  corridas seguidas del paso 6.
+
+    ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-ORIGINAL>
+    ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-REPLICA>
+    ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-MOTOR>
+
+    vmstat -t 1 300 > ~/cpu-$(hostname)-$(date +%H%M).txt
+
+  Columnas que importan: us + sy es la CPU usada, id la ociosa, st es la
+  que el hipervisor le quito a la instancia. SI st SUBE DE 0, LA INSTANCIA
+  SE ESTABA FRENANDO Y ESA CORRIDA NO VALE.
+
+
+---------------------------------------------------------------------
+6. LAS CORRIDAS (en la carpeta del paso 4)                [EC2 generador]
+---------------------------------------------------------------------
+
+  El loadtest vive dentro de la imagen que ya trae la AMI; no hay que
+  instalar Node ni levantar el stack en el generador.
+
+    # calentamiento: NO se reporta (JIT del motor y de Node)
+    docker run --rm trading-persistence:latest node scripts/loadtest.js --url $NLB --rate 1300 --duration 60 | tee 0-calentamiento.txt
+
+    # carga normal del enunciado: 500 ventas + 800 compras por minuto
+    docker run --rm trading-persistence:latest node scripts/loadtest.js --url $NLB --rate 1300 --duration 60 | tee 1-normal-1300.txt
+
+    # pico 5x
+    docker run --rm trading-persistence:latest node scripts/loadtest.js --url $NLB --rate 6500 --duration 60 | tee 2-pico-6500.txt
+
+    # relajacion: sin carga, solo observar cuanto tarda la cola en volver a 0
+    sleep 90
+
+  El --rate es en ordenes POR MINUTO, y el loadtest reparte solo la mezcla
+  800 compras / 500 ventas del enunciado (mismo 1300). El informe de cada
+  corrida marca OK o FALLA contra los limites del reto: p99 < 300 ms en
+  compra y < 500 ms en venta.
+
+  Durante el pico, en otra terminal del generador, el reparto en vivo. Si el
+  balanceador esta repartiendo, "enqueued" sube en LAS DOS:
+
+    watch -n 2 'for ip in 172.31.84.127 172.31.86.199; do
+                  echo -n "$ip  "
+                  curl -s http://$ip/api/v1/metrics |
+                    grep -o "\"enqueued\":[0-9]*\|\"queueDepth\":[0-9]*\|\"saturated\":[a-z]*" |
+                    tr "\n" "  "
+                  echo
+                done'
+
+
+---------------------------------------------------------------------
+7. CERRAR LA CORRIDA                                      [EC2 generador]
+---------------------------------------------------------------------
+
+    kill $(cat muestreo.pid)
+    curl -s -X POST 'http://172.31.84.127/api/v1/admin/reconcile?repair=true' > reconcile.json
+    curl -s http://172.31.84.127/api/v1/status > status-final-original.json
+    curl -s http://172.31.86.199/api/v1/status > status-final-replica.json
+
+  Anota a mano lo que no esta en ningun archivo. OJO: el bloque de abajo va
+  SIN SANGRIA, incluido el EOF final. Si copias el EOF con espacios delante
+  no cierra el heredoc y la terminal se queda esperando (Ctrl-C para salir).
+
+cat > NOTAS.md <<EOF
+Corrida: $RUN
+Variante: A (2 targets)
+Motor encendido desde: (hora)
+Quien ejecuto:
+Observaciones (errores, cosas raras, lo que se vio en el watch):
+EOF
+
+    ls -la
+
+  reconcile.json debe decir que no hay discrepancias. Si las hay,
+  anotarlo en NOTAS.md: es un hallazgo, no un fallo de la prueba.
+
+
+---------------------------------------------------------------------
+8. VARIANTE B: UN SOLO TARGET                                    [MAC]
+---------------------------------------------------------------------
+
+  No hay que desmontar nada. Se saca la replica del balanceador, se
+  repite desde el paso 4 con una carpeta nueva (Variante: B (1 target)
+  en las notas), y al terminar se vuelve a meter.
+
+    export AWS_PROFILE=arquisoft
+    TG=arn:aws:elasticloadbalancing:us-east-1:660360494821:targetgroup/trading-tg-80/d7601f5555d27d04
+
+    aws elbv2 deregister-targets --target-group-arn $TG --targets Id=i-0355dc1e06f770749
+    # ... corridas de B (pasos 4 a 7) ...
+    aws elbv2 register-targets   --target-group-arn $TG --targets Id=i-0355dc1e06f770749
+
+  La replica sale del balanceador pero SIGUE ENCENDIDA y con su API viva.
+  No la apagues: al volver a encenderla podria abrir una sesion nueva y
+  habria que rehacer el paso 3.
+
+  Esperar a que el target vuelva a "healthy" (comando del paso 2) antes
+  de otra corrida de A.
+
+
+---------------------------------------------------------------------
+9. GUARDAR LOS RESULTADOS EN EL REPOSITORIO                      [MAC]
+---------------------------------------------------------------------
+
+  !! EL GENERADOR Y LA REPLICA SON DESECHABLES: borrar el stack borra sus
+  !! discos con todo lo que haya dentro. Los resultados se bajan al Mac y
+  !! se versionan ANTES de desmontar nada.
+
+    cd ~/Perssitencia-trading
+    mkdir -p results
+
+    scp -i ~/.ssh/Arquisoft.pem -r ec2-user@<IP-PUBLICA-GENERADOR>:results/piloto-* results/
+    scp -i ~/.ssh/Arquisoft.pem 'ec2-user@<IP-PUBLICA-ORIGINAL>:cpu-*.txt' results/piloto-<fecha>/
+    scp -i ~/.ssh/Arquisoft.pem 'ec2-user@<IP-PUBLICA-REPLICA>:cpu-*.txt'  results/piloto-<fecha>/
+    scp -i ~/.ssh/Arquisoft.pem 'ec2-user@<IP-PUBLICA-MOTOR>:cpu-*.txt'    results/piloto-<fecha>/
+
+  La evidencia que guarda AWS, exportada a texto para no depender de la
+  retencion de CloudWatch (los puntos de 1 minuto solo duran 15 dias):
+
+    export AWS_PROFILE=arquisoft
+    for id in i-066240bbc580e697d i-0355dc1e06f770749 i-03d62904b8f2f5b48; do
+      aws cloudwatch get-metric-statistics --namespace AWS/EC2 --metric-name CPUUtilization \
+        --dimensions Name=InstanceId,Value=$id --period 60 --statistics Average Maximum \
+        --start-time "$(date -u -v-3H +%FT%TZ)" --end-time "$(date -u +%FT%TZ)" \
+        --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Average,Maximum]' --output text \
+        > results/piloto-<fecha>/cloudwatch-cpu-$id.tsv
+    done
+
+    git add results
+    git commit -m "results: piloto $(date +%F)"
+    git push
+
+  (En macOS, "date -v-3H" es "hace 3 horas". En Linux seria "date -d '-3 hours'".)
+
+  Cada carpeta de corrida termina con: los tres resumenes del loadtest,
+  las metricas cada 5 segundos, la CPU de cada maquina segundo a segundo,
+  la CPU segun CloudWatch, la reconciliacion, el estado final y las notas.
+  Con eso se puede rehacer cualquier tabla o grafica del informe sin
+  volver a medir.
+
+
+---------------------------------------------------------------------
+10. QUE GRABAR Y CAPTURAR
+---------------------------------------------------------------------
+
+  Los archivos del paso 9 son la evidencia principal: datos crudos y
+  reproducibles. Lo visual es complemento para la presentacion.
+
+  GRABACION DE PANTALLA (Mac: Cmd + Shift + 5, "Grabar toda la pantalla")
+  Una sola grabacion por corrida, con la pantalla dividida asi:
+    - Izquierda: la terminal del generador con el loadtest corriendo.
+    - Derecha arriba: la terminal con el watch de los /metrics de las dos
+      instancias, donde se ve el reparto en vivo.
+    - Derecha abajo: una de las terminales de vmstat (la del motor es la
+      mas interesante: va al 100 % siempre).
+  Empezar a grabar antes del calentamiento y parar despues del sleep 90.
+  Guardar el video con el mismo nombre de la carpeta de la corrida. No se
+  sube al repo (pesa demasiado): va a Drive con un enlace en NOTAS.md.
+
+  CAPTURAS DE LA CONSOLA DE AWS, al terminar cada corrida:
+    1. EC2 -> Target Groups -> trading-tg-80 -> Targets: las instancias y
+       su estado (2 healthy en A, 1 en B).
+    2. CloudWatch -> Metrics -> EC2 -> Per-Instance Metrics ->
+       CPUUtilization, con las tres instancias seleccionadas, periodo
+       1 minuto, ultimas 3 horas. Se ve la meseta, el pico y la bajada.
+    3. CloudWatch -> Metrics -> NetworkELB -> Per LB: ActiveFlowCount y
+       HealthyHostCount del trading-nlb, mismo rango.
+    4. CloudFormation -> Stacks -> trading-nlb -> Resources: prueba de
+       que se creo.
+  Las capturas si van al repo, en la misma carpeta de la corrida.
+
+
+---------------------------------------------------------------------
+11. AL TERMINAR LA SESION                                        [MAC]
+---------------------------------------------------------------------
+
+    export AWS_PROFILE=arquisoft
+
+    # apagar el monitoreo detallado
+    aws ec2 unmonitor-instances --instance-ids i-03d62904b8f2f5b48 i-066240bbc580e697d i-0355dc1e06f770749
+
+    # apagar las instancias (el motor es la que cuesta dinero encendida)
+    aws ec2 stop-instances --instance-ids i-03d62904b8f2f5b48 i-066240bbc580e697d i-0355dc1e06f770749 i-0517df006919e40f1
+
+  Si ya no se va a repetir el experimento, borrar el stack entero (NLB,
+  replica y generador), SOLO DESPUES de haber bajado los resultados:
+
+    aws cloudformation delete-stack --stack-name trading-nlb
+
+  Y lo que el stack NO se lleva y se factura por GB-mes: la AMI y su
+  snapshot. EC2 -> AMIs -> Anular registro, y despues EC2 -> Snapshots ->
+  Eliminar. Un NLB olvidado son ~16 USD/mes; una corrida entera cuesta
+  menos de 0.10 USD. El costo de medir es despreciable, el de olvidar no.
+
+
+---------------------------------------------------------------------
+12. SI ALGO FALLA
+---------------------------------------------------------------------
+
+  ssh se queda colgado y expira
+    -> IP publica vieja, o puerto 22 cerrado para tu IP. Repetir paso 2.
+  Permission denied (publickey)
+    -> permisos del .pem o llave equivocada: chmod 400 ~/.ssh/Arquisoft.pem
+  El DNS del NLB no resuelve o no responde desde el Mac
+    -> es lo esperado: el NLB es interno. Solo se alcanza desde la VPC,
+       o sea desde el generador. Ver el aviso del paso 0.
+  Target unhealthy
+    -> la API aun arranca o la base no responde. Esperar 1 min; luego
+       curl http://<ip-privada>/api/v1/ready desde el generador.
+  Ids de sesion distintos
+    -> la replica arranco con el motor en frio. Paso 3: la orden y el reinicio.
+  Se reinicio el motor (o se llamo a /api/v1/engine/reset) con los dos
+  backends arriba
+    -> split-brain: los dos detectan el reinicio, los dos rotan y cada uno
+       cierra la sesion del otro. Quedan dos sesiones con las ordenes
+       repartidas. Arreglo: docker compose restart api EN LAS DOS, y
+       comprobar de nuevo los session.id del paso 3 antes de medir.
+  HTTP 400 ValidationError al mandar una orden
+    -> formato JSON equivocado. La API publica quiere userId/assetId/price/
+       quantity, no idUsuario/idActivo/tipo. Ver el paso 3 BIS.
+  loadtest con muchos HTTP 503
+    -> backpressure: la cola de escritura llena. Es un resultado, no un
+       error: anotarlo y seguir.
+  loadtest con HTTP 502
+    -> el motor no contesta o va saturado. Mirar la terminal de vmstat del
+       motor y curl http://172.31.21.117:8080/api/estadisticas.
+  st > 0 en vmstat
+    -> la instancia se quedo sin creditos de CPU. Esperar 10 min y repetir
+       la corrida; anotarlo.
+  aws responde con otra cuenta
+    -> no se exporto el perfil en esa terminal: export AWS_PROFILE=arquisoft
+
+
+---------------------------------------------------------------------
+LIMITACION DEL PILOTO
+---------------------------------------------------------------------
+
+  El loadtest actual reparte la carga uniforme entre los 5 activos y no
+  hace llegadas Poisson ni fases automaticas. Para la corrida larga con
+  activos calientes hara falta un generador nuevo. Para el piloto, esto
+  basta para ver si el motor aguanta el 5x y si el reparto del
+  balanceador ocurre.

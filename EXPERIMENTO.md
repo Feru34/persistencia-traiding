@@ -35,7 +35,7 @@ a la base de datos (`PERSIST_MODE=async` vs `sync`).
                                  EC2 motor (t3.micro, us-east-1b)
                                  172.31.21.117 · Corretto 21 · MatchineEngine.jar
                                           
-  EC2 backend ──TLS 5432──▶ RDS PostgreSQL 18.3 (db.t3.micro, us-east-1f)
+  EC2 backend ──TLS 5432──▶ RDS PostgreSQL 18.3 (db.t4g.micro, us-east-1f)
                             arquisoft-bbdd.cgl68cawebpp.us-east-1.rds.amazonaws.com
                             base `trading` · 20 GB gp2 · 172.31.70.209
 ```
