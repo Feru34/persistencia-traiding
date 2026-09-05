@@ -6,7 +6,7 @@ Description: >
   generadora de carga. Todo en una sola AZ, para que ni la latencia ni el
   costo se vean afectados por el tráfico entre zonas.
 
-  Se borra entero con: aws cloudformation delete-stack --stack-name trading-nlb
+  Se borra entero con: aws cloudformation delete-stack --profile arquisoft --stack-name trading-nlb
 
 Parameters:
   VpcId:

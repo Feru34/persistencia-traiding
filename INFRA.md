@@ -385,11 +385,19 @@ despliegue (EXPERIMENTO.md §9), ahora visible en la topología.
 
 Verificado leyendo `src/services/sessionManager.js`:
 
-- **Comparten sesión sin cambios.** Al arrancar, la réplica encuentra la sesión
-  abierta en la RDS, comprueba que el motor conserva su libro
+- **Comparten sesión, con una condición.** Al arrancar, la réplica encuentra la
+  sesión abierta en la RDS, comprueba que el motor conserva su libro
   (`ordenesProcesadasTotales >= órdenes registradas`) y la **reanuda** en vez de
   abrir una nueva. Ambos backends escriben bajo el mismo `engine_session_id`,
   así que cualquier trade se resuelve contra órdenes de cualquiera de los dos.
+  **Excepción, verificada el 2026-09-05:** si el motor lleva **cero** órdenes
+  procesadas (recién arrancado o tras un reset), `init()` no puede distinguirlo
+  de un reinicio y la réplica abre una sesión nueva, cerrando la de la
+  original. Síntoma: `/api/v1/status` da un `session.id` distinto en cada
+  instancia. Arreglo: inyectar **una** orden por cualquiera de las dos y
+  reiniciar la API de la otra (`docker compose restart api`, o
+  `aws ec2 reboot-instances` si no hay SSH a mano); al volver, reanuda la
+  sesión abierta. Comprobar que los dos `session.id` coinciden antes de medir.
 - **No hay rotaciones espurias.** El contador de ids del motor es global y
   monótono mientras viva la JVM, así que la secuencia de ids que ve cada
   instancia también sube. `observeEngineOrderId` no se dispara.
@@ -413,19 +421,30 @@ olvidarse un balanceador encendido.
 
 #### Paso 0 — credenciales y permisos
 
-Desde tu equipo, con la CLI de AWS instalada:
+Desde tu equipo, con la CLI de AWS instalada. La cuenta de este proyecto es
+distinta de la que la CLI usa por defecto en la máquina, así que va en un
+**perfil con nombre** (`arquisoft`) y no en el perfil `default`: así no se
+pisa nada y no hay que reconfigurar al volver a la otra cuenta.
 
 ```bash
-aws configure       # Access Key, Secret Key, región us-east-1, salida json
-aws sts get-caller-identity      # comprobar que responde con tu cuenta
+aws configure --profile arquisoft   # Access Key, Secret Key, región us-east-1, salida json
+aws sts get-caller-identity --profile arquisoft   # comprobar que responde con ESTA cuenta
 ```
+
+Todos los comandos `aws` de esta sección llevan `--profile arquisoft`. Para no
+escribirlo cada vez en una sesión de terminal: `export AWS_PROFILE=arquisoft`.
+
+**Todo el proyecto vive en `us-east-1` (Virginia)**: las EC2, la RDS, la AMI
+y el stack. El perfil ya fija esa región; en la consola web, comprobar el
+selector de región arriba a la derecha antes de buscar nada, porque una AMI o
+un stack creados en otra región no aparecen.
 
 El usuario IAM necesita, como mínimo, poder actuar sobre
 `cloudformation:*`, `ec2:*` y `elasticloadbalancing:*`. Si usas un usuario
 personal con `AdministratorAccess` en una cuenta de laboratorio, ya está.
 
 > **Las claves de acceso no se pegan en un chat ni se suben al repo.** Viven en
-> `~/.aws/credentials` de tu máquina. El rol de la EC2
+> `~/.aws/credentials` de tu máquina, bajo `[arquisoft]`. El rol de la EC2
 > (`EC2-CloudWatchRole`) **no** tiene estos permisos, así que el despliegue se
 > lanza desde tu equipo, no desde la instancia.
 
@@ -449,10 +468,37 @@ CloudFormation no puede fotografiar una instancia que ya existe, así que este
 paso es manual. **Un snapshot de EBS por sí solo no se puede lanzar**: hace
 falta la AMI, que incluye el snapshot más la plantilla de arranque.
 
-`EC2 → Instancias → la de persistencia → Acciones → Imagen y plantillas →
-Crear imagen`. Nombre `trading-persistencia-v1`, el resto por defecto. En
-`EC2 → AMIs`, esperar a que pase de *pending* a **available** (5–10 min) y
-copiar el id `ami-0abc...`.
+La AMI **no se crea desde la página de AMIs** (ahí solo se listan; estará vacía
+hasta que exista una). Se crea **desde la instancia**:
+`EC2 → Instancias → la de persistencia (i-066240bbc580e697d) → Acciones →
+Imagen y plantillas → Crear imagen`. Nombre `trading-persistencia-v1`, el
+resto por defecto. Al aceptar, aparece en `EC2 → Imágenes → AMIs` (filtro
+*Owned by me*, región us-east-1); esperar a que pase de *pending* a
+**available** (5–10 min) y copiar el id `ami-0abc...`.
+
+Antes de crearla, dejar la instancia en el estado que se quiere clonar:
+`git pull`, `docker compose up -d --build` y el `.env` correcto. La AMI se
+lleva el disco entero (repo, `.env` con la RDS e imagen Docker construida), y
+eso es lo que hace que la réplica y el generador arranquen sin instalar nada.
+
+Lo mismo por CLI:
+
+```bash
+aws ec2 create-image --profile arquisoft \
+  --instance-id i-066240bbc580e697d \
+  --name trading-persistencia-v1 \
+  --description "Persistencia trading: Docker, repo y .env"
+
+aws ec2 wait image-available --profile arquisoft \
+  --filters Name=name,Values=trading-persistencia-v1
+aws ec2 describe-images --profile arquisoft --owners self \
+  --query 'Images[].[ImageId,Name,State]' --output table
+```
+
+Por defecto **reinicia la instancia** para que el disco quede consistente. Es
+aceptable: Docker está habilitado y los contenedores vuelven solos (ver
+*Arranque automático*). `--no-reboot` lo evita, pero entonces conviene que la
+cola write-behind esté vacía (`/api/v1/status`) para no clonar un lote a medias.
 
 #### Paso 3 — reunir los parámetros
 
@@ -468,7 +514,7 @@ copiar el id `ami-0abc...`.
 #### Paso 4 — desplegar
 
 ```bash
-aws cloudformation deploy \
+aws cloudformation deploy --profile arquisoft \
   --stack-name trading-nlb \
   --template-file infra/nlb-experimento.yaml \
   --parameter-overrides \
@@ -487,7 +533,7 @@ y los parámetros se piden en un formulario.
 #### Paso 5 — sacar el DNS del balanceador
 
 ```bash
-aws cloudformation describe-stacks --stack-name trading-nlb \
+aws cloudformation describe-stacks --profile arquisoft --stack-name trading-nlb \
   --query 'Stacks[0].Outputs' --output table
 ```
 
@@ -495,6 +541,17 @@ aws cloudformation describe-stacks --stack-name trading-nlb \
 
 `EC2 → Target Groups → trading-tg-80 → Targets`: las dos instancias deben decir
 **healthy**. Si una sale *unhealthy*, casi siempre es el puerto 80 en el SG.
+
+#### Paso 7 — comprobar que las dos instancias comparten sesión
+
+```bash
+curl -s http://<ip-original>/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+curl -s http://<ip-replica>/api/v1/status  | grep -o '"session":{"id":"[^"]*"'
+```
+
+Si los ids difieren, ver *Dos backends contra un motor* más arriba (motor en
+frío). No medir hasta que coincidan: los trades de una instancia no
+resolverían las órdenes de la otra.
 
 ### Medir
 
@@ -519,7 +576,7 @@ curl http://<ip-privada-B>/api/v1/metrics
 ### Desmontaje
 
 ```bash
-aws cloudformation delete-stack --stack-name trading-nlb
+aws cloudformation delete-stack --profile arquisoft --stack-name trading-nlb
 ```
 
 Borra NLB, listener, target group, réplica, generador y la regla de SG añadida.
