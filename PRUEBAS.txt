@@ -1,0 +1,265 @@
+=====================================================================
+LAS DOS PRUEBAS DE CARGA: TIEMPOS, PETICIONES Y CRITERIOS
+Backend de Persistencia de Trading - ARTI4109 Reto 1
+=====================================================================
+
+Que se ejecuta exactamente, con que tasa, cuanto dura y que tiene que
+salir para darlo por bueno. El montaje y la operacion estan en PILOTO.txt;
+esto es solo el protocolo de las corridas. Los requisitos vienen de
+EXPERIMENTO.md seccion 1. La misma guia esta en el repo como PRUEBAS.md.
+
+Todo se ejecuta DENTRO de la EC2 generadora:
+    ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-GENERADOR>
+El NLB es interno: desde un portatil su DNS no responde.
+
+
+---------------------------------------------------------------------
+LAS DOS PRUEBAS DE UN VISTAZO
+---------------------------------------------------------------------
+
+  PRUEBA 1 - CARGA SOSTENIDA
+    Enunciado : 500 ventas/min + 800 compras/min = 1300 ordenes/min
+    Comprueba : que en regimen normal se cumplen los tiempos de registro
+    Duracion  : 60 s de medicion + 60 s de calentamiento que se descarta
+
+  PRUEBA 2 - PICO
+    Enunciado : 5000 EMPAREJAMIENTOS/min
+    Comprueba : que aguanta la rafaga y que SE PONE AL DIA despues
+    Duracion  : 60 s de carga + 90 s de relajacion + calentamiento
+
+  !! OJO: el enunciado pide el pico en EMPAREJAMIENTOS, no en ordenes.
+  !! No son lo mismo. Ver el apartado de cuantas peticiones hacen falta.
+
+
+---------------------------------------------------------------------
+CRITERIOS DE ACEPTACION
+---------------------------------------------------------------------
+
+  1  Registro de VENTA   p99 < 500 ms                    (enunciado)
+  2  Registro de COMPRA  p99 < 300 ms                    (enunciado)
+  3  p95 < 100 ms  Y  p99 < 200 ms                       (criterio estricto)
+  4  Recuperacion tras el pico <= 5 min                  (criterio del curso)
+  5  Cero perdidas: dropped 0, deadLettered 0, cola a 0  (integridad)
+  6  reconcile.json sin deriva contra el libro del motor (integridad)
+
+  El criterio 3 es mas exigente que el 1 y el 2, asi que es el que manda.
+  EL LOADTEST SOLO MARCA OK/FALLA CONTRA EL 1 Y EL 2: el 3 hay que
+  comprobarlo a mano leyendo los campos p95= y p99= de la salida.
+
+
+---------------------------------------------------------------------
+CUANTAS PETICIONES SON 5000 EMPAREJAMIENTOS
+---------------------------------------------------------------------
+
+  Un emparejamiento no es una peticion: consume dos ordenes, o partes de
+  dos. Medido el 2026-09-05 en la infraestructura real:
+
+      1299 ordenes  ->  441 emparejamientos  =  0,34 trades por orden
+
+  Luego 5000 emparejamientos/min son unas 14 700 ordenes/min, NO 6500.
+  Por eso la Prueba 2 va en dos variantes, y en el informe hay que decir
+  cual se uso:
+
+    2a  pico 5x           6 500 ordenes/min   6 498 peticiones en 60 s
+        cinco veces la carga nominal; rinde ~2 200 emparejamientos/min
+
+    2b  pico del enunciado 14 724 ordenes/min  14 724 peticiones en 60 s
+        apunta a los 5000 emparejamientos/min literales
+
+  El ratio 0,34 depende del solape de precios: HAY QUE VERIFICARLO EN
+  CADA CORRIDA (ver mas abajo). Si sale distinto, se ajusta y se anota.
+
+
+---------------------------------------------------------------------
+ANTES DE EMPEZAR
+---------------------------------------------------------------------
+
+    # 1. traerse la ultima version de las guias
+    cd ~/Perssitencia-trading && git pull
+
+    # 2. las dos sesiones deben COINCIDIR (si no: PILOTO.txt paso 3)
+    curl -s http://172.31.84.127/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+    curl -s http://172.31.86.199/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+
+    # 3. carpeta de la corrida, URL y numero de contenedores
+    RUN=~/results/$(date +%F-%H%M)-P1-C; mkdir -p $RUN; cd $RUN
+    NLB=http://trading-nlb-3873526197343ac2.elb.us-east-1.amazonaws.com
+    N=6
+    URL=$NLB
+
+  POR QUE 6 CONTENEDORES Y NO UNO: el NLB reparte CONEXIONES TCP, no
+  peticiones. Un solo contenedor mantiene una unica conexion y toda la
+  carga cae en una maquina. Medido: original 1740 / replica 0. El detalle
+  completo esta en PILOTO.txt paso 6.
+
+
+---------------------------------------------------------------------
+PRUEBA 1 - CARGA SOSTENIDA
+---------------------------------------------------------------------
+
+  Objetivo: verificar los tiempos de registro en regimen estable.
+
+    Tasa objetivo        1300 ordenes/min
+    Contenedores N       6
+    Tasa por contenedor  216 ordenes/min
+    Tasa real agregada   1296 ordenes/min  (-0,3% por redondeo entero)
+    Duracion             60 s
+    PETICIONES TOTALES   1296   (~797 compras / ~499 ventas)
+
+    # calentamiento -- NO se reporta
+    for i in $(seq $N); do
+      docker run --rm trading-persistence:latest node scripts/loadtest.js \
+        --url $URL --rate 216 --duration 60 > 0-calentamiento-$i.txt &
+    done; wait
+
+    # medicion
+    for ip in 172.31.84.127 172.31.86.199; do
+      echo -n "$ip  "; curl -s http://$ip/api/v1/metrics | grep -o '"enqueued":[0-9]*'
+    done | tee reparto-antes.txt
+
+    for i in $(seq $N); do
+      docker run --rm trading-persistence:latest node scripts/loadtest.js \
+        --url $URL --rate 216 --duration 60 > 1-sostenida-$i.txt &
+    done; wait
+
+    for ip in 172.31.84.127 172.31.86.199; do
+      echo -n "$ip  "; curl -s http://$ip/api/v1/metrics | grep -o '"enqueued":[0-9]*'
+    done | tee reparto-despues.txt
+
+  Que anotar: el PEOR p95 y p99 de los 6 contenedores (criterio 3), la
+  suma de "ordenes ok" y "fallidas", y el reparto (la resta antes/despues).
+
+
+---------------------------------------------------------------------
+PRUEBA 2 - PICO
+---------------------------------------------------------------------
+
+  Objetivo: ver si aguanta la rafaga y, sobre todo, CUANTO TARDA EN
+  PONERSE AL DIA cuando la rafaga acaba.
+
+                            2a pico 5x      2b pico del enunciado
+    Tasa objetivo           6 500/min       14 724/min
+    Tasa por contenedor     1083            2454
+    Duracion de carga       60 s            60 s
+    PETICIONES TOTALES      6 498           14 724
+    Relajacion posterior    90 s sin carga  90 s sin carga
+
+    RATE=1083          # 2a;  usar 2454 para la 2b
+
+    # estado de partida, para las restas
+    curl -s http://172.31.21.117:8080/api/estadisticas > motor-antes.json
+    for ip in 172.31.84.127 172.31.86.199; do
+      echo -n "$ip  "; curl -s http://$ip/api/v1/metrics | grep -o '"enqueued":[0-9]*'
+    done | tee reparto-antes.txt
+
+    for i in $(seq $N); do
+      docker run --rm trading-persistence:latest node scripts/loadtest.js \
+        --url $URL --rate $RATE --duration 60 > 2-pico-$i.txt &
+    done; wait
+
+    echo "FIN DE CARGA: $(date -u +%FT%TZ)" | tee fin-de-carga.txt
+
+    # relajacion: NO lanzar nada mas. El muestreo del paso 4 de PILOTO
+    # sigue escribiendo metrics.ndjson cada 5 s; de ahi sale el tiempo
+    # de recuperacion.
+    sleep 90
+
+    curl -s http://172.31.21.117:8080/api/estadisticas > motor-despues.json
+
+  MEDIR LA RECUPERACION (criterio 4). Es el tiempo desde "FIN DE CARGA"
+  hasta el primer instante en que queueDepth vuelve a 0 en LAS DOS:
+
+    grep -o '"t":"[^"]*"\|"queueDepth":[0-9]*\|"node":"[^"]*"' metrics.ndjson |
+      paste - - - | tail -40
+
+  Si queueDepth nunca subio de 0, la recuperacion fue inmediata -- pero
+  eso significa que el pico no llego a estresar nada, y hay que decirlo
+  asi en el informe, no venderlo como un aprobado holgado.
+
+  COMPROBAR LOS EMPAREJAMIENTOS LOGRADOS (dice si la 2b llego a 5000/min):
+
+    python3 -c "
+    import json
+    a=json.load(open('motor-antes.json')); d=json.load(open('motor-despues.json'))
+    t=d['tradesEmparejados']-a['tradesEmparejados']
+    o=d['ordenesProcesadasTotales']-a['ordenesProcesadasTotales']
+    print(f'ordenes={o}  emparejamientos={t}  ratio={t/o:.3f}')"
+
+
+---------------------------------------------------------------------
+LA MATRIZ DE CORRIDAS
+---------------------------------------------------------------------
+
+  Cada prueba se repite en las TRES configuraciones de INFRA.md, porque
+  con solo dos no se separa el peaje del balanceador de la ganancia de
+  escalar:
+
+                     A directo            B NLB 1 target   C NLB 2 targets
+    URL              172.31.84.127        $NLB             $NLB
+    Preparacion      ninguna              desregistrar     las dos
+                                          la replica       registradas
+    Prueba 1         [ ]                  [ ]              [ ]
+    Prueba 2         [ ]                  [ ]              [ ]
+
+    PEAJE DEL BALANCEADOR = B - A
+    GANANCIA DE ESCALAR   = C - B
+
+  Como cambiar de configuracion: PILOTO.txt paso 8. Una carpeta por
+  celda, nombrada  <fecha>-P<1|2>-<A|B|C>.
+
+
+---------------------------------------------------------------------
+PLANTILLA DE RESULTADOS (una por corrida, en NOTAS.md)
+---------------------------------------------------------------------
+
+Prueba (1 sostenida | 2a pico 5x | 2b pico enunciado):
+Configuracion (A directo | B NLB 1 | C NLB 2):
+N contenedores:                    Tasa por contenedor:
+Ordenes ok (suma de los N):        Fallidas (suma):
+Peor p95  compra / venta:                    (criterio: < 100 ms)
+Peor p99  compra / venta:                    (criterio: < 200 / 300 / 500 ms)
+Reparto enqueued  original / replica:
+Emparejamientos logrados:                    emparejamientos/min:
+maxQueueDepth  original / replica:
+Recuperacion (s desde FIN DE CARGA a queueDepth 0):
+dropped / deadLettered / conflicts:
+Discrepancias en reconcile.json:
+Observaciones:
+
+  LOS PERCENTILES NO SE PROMEDIAN. De los N contenedores se reporta el
+  PEOR p95 y p99 como cota superior; n, throughput y fallidas SI se suman.
+
+    grep -h '^  BUY'  1-sostenida-*.txt | sed 's/.*p99=\([0-9.]*\)ms.*/\1/' | sort -g | tail -1
+    grep -h '^  SELL' 1-sostenida-*.txt | sed 's/.*p99=\([0-9.]*\)ms.*/\1/' | sort -g | tail -1
+
+
+---------------------------------------------------------------------
+EVIDENCIA QUE SE GUARDA POR CORRIDA
+---------------------------------------------------------------------
+
+  0-calentamiento-*.txt              descartado, pero se guarda
+  1-sostenida-*.txt / 2-pico-*.txt   los N informes del loadtest
+  reparto-antes.txt / -despues.txt   prueba de que el balanceador repartio
+  motor-antes.json / -despues.json   emparejamientos logrados
+  fin-de-carga.txt                   marca temporal para la recuperacion
+  metrics.ndjson                     cola y conteos cada 5 s (PILOTO paso 4)
+  cpu-*.txt                          vmstat de cada maquina
+  reconcile.json                     integridad contra el libro del motor
+  NOTAS.md                           la plantilla de arriba, rellena
+
+  Y AL TERMINAR, BAJARLO TODO AL PORTATIL Y SUBIRLO AL REPO (PILOTO paso
+  9): el generador y la replica son desechables y delete-stack borra sus
+  discos con todo lo que haya dentro.
+
+
+---------------------------------------------------------------------
+NOTAS CONOCIDAS
+---------------------------------------------------------------------
+
+  - reconcile.json mostrara UNA entrada en "unknownToBackend": la orden
+    id 4 del motor (venta de 1 a 999), inyectada el 2026-09-05 para
+    reparar las sesiones. Es esperada. Al ser una venta a 999 y operar el
+    loadtest entre 50 y 70, nunca cruza y no altera las medidas.
+  - El loadtest reparte la carga uniforme entre los 5 activos y no hace
+    llegadas Poisson ni fases automaticas. Para una corrida larga con
+    activos calientes haria falta otro generador.
