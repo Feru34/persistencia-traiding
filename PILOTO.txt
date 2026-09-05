@@ -105,7 +105,22 @@ Donde se ejecuta cada cosa:
   Las claves nunca se pegan en un chat, ni se suben al repo, ni se
   comparten por mensaje.
 
-1.3 La llave SSH
+1.3 La llave SSH  --  SIN ESTO NO SE PUEDE CORRER EL PILOTO
+
+  !! REQUISITO DURO. La carga se lanza desde la EC2 generadora, porque el
+  !! NLB es interno y su DNS solo se alcanza desde dentro de la VPC. Y la
+  !! unica via de entrada a esa maquina es SSH con Arquisoft.pem: las
+  !! instancias no tienen agente SSM (comprobado: describe-instance-
+  !! information devuelve vacio y tres de las cuatro no tienen perfil IAM).
+  !!
+  !! Las cuatro usan el MISMO par de llaves, "Arquisoft" (key-01adacd278d4c02a3,
+  !! creado el 2026-09-03). AWS no permite volver a descargar el .pem: si se
+  !! perdio, hay que pedirselo a quien creo las instancias. Crear un par
+  !! nuevo NO sirve para las maquinas que ya existen.
+  !!
+  !! Quien vaya a correr el piloto necesita ese archivo ANTES de empezar.
+  !! Sin el se pueden mirar las APIs por IP publica y mandar comandos de
+  !! aws-cli, pero NO se puede lanzar el loadtest.
 
   Copiar Arquisoft.pem a ~/.ssh/ y restringir permisos (si no, ssh se
   niega a usarla):
@@ -177,10 +192,39 @@ Donde se ejecuta cada cosa:
 3. ENTRAR AL GENERADOR Y COMPROBAR LA SESION DEL MOTOR     [EC2 generador]
 ---------------------------------------------------------------------
 
+  !! LAS 172.31.x.x SON PRIVADAS: NO RESPONDEN DESDE TU PORTATIL.
+  !! Solo funcionan DENTRO de la VPC, o sea despues del ssh de abajo. Si
+  !! pegas un curl a una 172.31.x.x desde el Mac, se queda colgado hasta
+  !! que expira. No esta roto: es que no hay ruta.
+
     ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-GENERADOR>
+
+  Ya DENTRO del generador (privadas):
 
     curl -s http://172.31.84.127/api/v1/status | grep -o '"session":{"id":"[^"]*"'
     curl -s http://172.31.86.199/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+
+  El MISMO chequeo DESDE EL MAC, sin entrar a ninguna maquina, cambiando
+  la privada por la publica (el puerto 80 esta abierto al mundo):
+
+    curl -s http://34.226.139.255/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+    curl -s http://44.201.252.165/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+
+  Equivalencias, para traducir cualquier comando de esta guia:
+
+      privada (dentro)   publica (desde el Mac)   maquina
+      172.31.84.127      34.226.139.255           original
+      172.31.86.199      44.201.252.165           replica
+      172.31.21.117      54.227.51.136            motor
+      172.31.88.252      54.159.150.22            generador
+
+  QUE SE PUEDE HACER DESDE EL MAC con las publicas: todas las consultas de
+  diagnostico -- /status, /ready, /metrics, /sessions, /admin/reconcile y
+  las /api/estadisticas y /api/libro del motor en el 8080.
+
+  QUE NO: el loadtest. El NLB es interno y su DNS solo resuelve dentro de
+  la VPC, asi que la carga TIENE que salir del generador. Por eso hace
+  falta la llave (punto 1.3).
 
   LOS DOS IDS DEBEN SER IGUALES. Si no lo son, no midas: los trades de una
   instancia no resolverian las ordenes de la otra. Arreglo: manda una orden
@@ -193,51 +237,44 @@ Donde se ejecuta cada cosa:
     # en otra terminal del Mac, contra la EC2 original:
     ssh -i ~/.ssh/Arquisoft.pem ec2-user@<IP-PUBLICA-ORIGINAL> 'cd persistencia-traiding && docker compose restart api'
 
-  ESTADO REAL COMPROBADO EL 2026-09-05 (hay que arreglarlo antes de medir):
+  ESTADO: RESUELTO EL 2026-09-05 A LAS 17:11 UTC. Las dos instancias
+  comparten ya la sesion 01a07273-5682-71be-879a-045b9b077ba1, las dos
+  responden /ready 200 y los dos targets del NLB estan "healthy". No hay
+  que repetir este arreglo salvo que se reinicie el motor.
 
-      original  session.id  01a07273-5682-71be-879a-045b9b077ba1
-      replica   session.id  01a07273-5475-7e4c-ae91-03ad3984486d
+  Como se hizo, por si vuelve a pasar (no hizo falta tocar codigo, ni
+  reconstruir la imagen, ni rehacer la infra):
+    1. Se inyecto una orden suelta para que el motor dejara de estar en
+       cero:  POST /api/v1/orders/sell {"userId":1,"assetId":2,
+       "price":999,"quantity":1}
+    2. Se comprobo en /api/v1/sessions CUAL sesion estaba abierta
+       (ended_at: null) y cual instancia se habia quedado con una cerrada.
+       ESTO IMPORTA: hay que reiniciar la instancia de la sesion CERRADA,
+       no la otra. Reiniciar la equivocada no rompe nada, pero no arregla.
+    3. Se reinicio esa instancia. Al arrancar lee la sesion abierta de la
+       RDS y la reanuda.
 
-  SON DISTINTOS. Y el motor esta en frio, que es justo la causa:
+  Sin la llave SSH se puede reiniciar igual, por API (los contenedores
+  llevan restart=unless-stopped, asi que vuelven solos, y un reboot NO
+  cambia la IP publica; un stop/start si):
 
-      curl -s http://172.31.21.117:8080/api/estadisticas
-      {"ordenesEnCompra":0,"ordenesEnVenta":0,"tradesEmparejados":0,
-       "ultimaOrdenRecibida":0,"ordenesProcesadasTotales":0}
+    aws ec2 reboot-instances --instance-ids <id-de-la-instancia>
 
-  QUE SE ROMPE EXACTAMENTE, si se mide con las sesiones partidas:
+  Condicion que decide si reanuda o vuelve a rotar, de sessionManager.js:
+  reanuda si (procesadas > 0 o en libro > 0) Y procesadas >= ordenes de la
+  sesion abierta. Comprobado en vivo: ordenesProcesadasTotales del motor
+  SI cuenta las ordenes ingeridas (paso de 0 a 1 con una sola orden), no
+  solo las emparejadas.
 
-    Las LATENCIAS si valen. El camino de una orden es persistir, inyectar
-    al motor y responder: no cruza sesiones. El p99 de compra y venta
-    mediria lo que dice medir, y el motor tampoco se entera (su contador
-    es global y cada instancia ve una subsecuencia creciente, asi que no
-    hay rotaciones espurias).
+  RESIDUO CONOCIDO: la orden de reparacion (id 4 del motor, venta de 1 a
+  999 del usuario 1 sobre el activo 2) quedo registrada en la sesion
+  ANTERIOR, ya cerrada, pero sigue viva en el libro del motor. Por tanto
+  reconcile.json del paso 7 mostrara UNA entrada en "unknownToBackend".
+  Es esa, y es esperada: anotarlo en NOTAS.md. No estorba a la medicion,
+  porque es una venta a 999 y el loadtest opera entre 50 y 70: nunca
+  cruza.
 
-    Lo que se corrompe es TODO LO DEMAS, y en silencio. El bridge es
-    singleton y publica en su API local, asi que todos los trades entran
-    por la original y se sellan con la sesion de la original. El
-    TradeEvent solo trae dos ids de orden, y el backend reconstruye lo
-    demas cruzando contra las ordenes DE ESA SESION
-    (src/services/persistence.js, findByEngineIds). Cuando el motor
-    empareja una compra de una instancia contra una venta de la otra, una
-    pata esta en la otra sesion y no aparece.
-
-    El trade se guarda igual -- hay un comentario explicito de que nunca
-    se pierde el hecho economico -- pero con la mitad de los campos en
-    null: buyOrderId/sellOrderId, buyerUserId/sellerUserId, y assetId si
-    fallan las dos patas. No hay error en los logs. Consecuencias:
-      - las ordenes de la otra instancia se quedan en ACCEPTED para
-        siempre, con filledQuantity en 0
-      - esos usuarios no mueven posicion ni caja
-      - reconcile (paso 7) compara el libro del motor contra las ordenes
-        de SU sesion: media libro caeria en "unknownToBackend", asi que
-        reconcile.json sale inservible como evidencia
-    Con reparto ~50/50, cerca de la mitad de las patas se pierden asi.
-
-  Conclusion: se podria medir latencia hoy, pero la evidencia de
-  correctitud seria basura silenciosa. Como es medio informe, no compensa:
-  el arreglo de arriba son dos minutos. No seguir hasta que los dos ids
-  coincidan.
-
+  QUE SE ROMPERIA si se midiera con las sesiones partidas:
   Por que funciona: al arrancar, un backend reanuda la sesion abierta en la
   RDS solo si comprueba que el motor conserva su libro. Con el motor recien
   encendido (cero ordenes procesadas) no puede distinguirlo de un reinicio y
@@ -355,28 +392,95 @@ Donde se ejecuta cada cosa:
 6. LAS CORRIDAS (en la carpeta del paso 4)                [EC2 generador]
 ---------------------------------------------------------------------
 
-  El loadtest vive dentro de la imagen que ya trae la AMI; no hay que
-  instalar Node ni levantar el stack en el generador.
+  LAS TRES CONFIGURACIONES (nomenclatura de INFRA.md; usar ESTA, no otra):
+
+      A   generador -> 1 EC2 DIRECTO, sin balanceador   linea base
+      B   generador -> NLB -> 1 target                  peaje del NLB = B - A
+      C   generador -> NLB -> 2 targets                 ganancia de escalar = C - B
+
+  Con solo B y C no se puede concluir nada: si la latencia baja, no se sabe
+  cuanto fue por escalar y cuanto por el camino de red nuevo. La corrida A
+  es gratis (no crea nada en AWS, solo cambia la URL), asi que se hace.
+
+  Cada configuracion cambia UNA cosa:
+
+    A:  URL = http://172.31.84.127        (IP privada del original)
+    B:  URL = $NLB, con la replica DESREGISTRADA   (paso 8)
+    C:  URL = $NLB, con los dos targets registrados
+
+  ---------------------------------------------------------------------
+  POR QUE LA CARGA VA EN VARIOS CONTENEDORES (no es un capricho)
+  ---------------------------------------------------------------------
+
+  El NLB es de capa 4: reparte CONEXIONES TCP, no peticiones HTTP. Una
+  conexion se pega a un target y se queda ahi toda su vida.
+
+  En modo --rate el loadtest manda una orden cada 60000/rate ms y cada una
+  tarda ~8 ms, asi que NUNCA hay dos en vuelo: fetch reutiliza UNA sola
+  conexion. Un contenedor = una conexion = un target = 0% de reparto.
+
+  Medido el 2026-09-05 con un solo contenedor a 1300/min:
+      original  enqueued=1740      replica  enqueued=0
+  El 100% fue a una maquina. La corrida "C" midio en realidad una "B".
+
+  Y no se arregla subiendo al pico: a 6500/min son 108/s x 8 ms = 0,9
+  peticiones concurrentes. Seguiria siendo una conexion.
+
+  La solucion no toca codigo ni infraestructura y no cuesta un centavo
+  extra: N contenedores en paralelo, cada uno con su conexion y con
+  rate/N. Con N=6 la probabilidad de que los seis caigan en el mismo
+  target es ~3%; con N=8, ~0,8%.
+
+  ---------------------------------------------------------------------
+  LAS CORRIDAS
+  ---------------------------------------------------------------------
+
+    N=6                       # contenedores en paralelo
+    URL=$NLB                  # o http://172.31.84.127 para la config A
 
     # calentamiento: NO se reporta (JIT del motor y de Node)
-    docker run --rm trading-persistence:latest node scripts/loadtest.js --url $NLB --rate 1300 --duration 60 | tee 0-calentamiento.txt
+    for i in $(seq $N); do
+      docker run --rm trading-persistence:latest node scripts/loadtest.js \
+        --url $URL --rate $((1300/N)) --duration 60 > 0-calentamiento-$i.txt &
+    done; wait
 
     # carga normal del enunciado: 500 ventas + 800 compras por minuto
-    docker run --rm trading-persistence:latest node scripts/loadtest.js --url $NLB --rate 1300 --duration 60 | tee 1-normal-1300.txt
+    for i in $(seq $N); do
+      docker run --rm trading-persistence:latest node scripts/loadtest.js \
+        --url $URL --rate $((1300/N)) --duration 60 > 1-normal-$i.txt &
+    done; wait
 
     # pico 5x
-    docker run --rm trading-persistence:latest node scripts/loadtest.js --url $NLB --rate 6500 --duration 60 | tee 2-pico-6500.txt
+    for i in $(seq $N); do
+      docker run --rm trading-persistence:latest node scripts/loadtest.js \
+        --url $URL --rate $((6500/N)) --duration 60 > 2-pico-$i.txt &
+    done; wait
 
-    # relajacion: sin carga, solo observar cuanto tarda la cola en volver a 0
+    # relajacion: sin carga, para ver cuanto tarda la cola en volver a 0
     sleep 90
 
-  El --rate es en ordenes POR MINUTO, y el loadtest reparte solo la mezcla
-  800 compras / 500 ventas del enunciado (mismo 1300). El informe de cada
-  corrida marca OK o FALLA contra los limites del reto: p99 < 300 ms en
-  compra y < 500 ms en venta.
+  El --rate es en ordenes POR MINUTO y el loadtest reparte solo la mezcla
+  800 compras / 500 ventas del enunciado. Cada contenedor marca OK o FALLA
+  contra los limites del reto: p99 < 300 ms en compra, < 500 ms en venta.
 
-  Durante el pico, en otra terminal del generador, el reparto en vivo. Si el
-  balanceador esta repartiendo, "enqueued" sube en LAS DOS:
+  ---------------------------------------------------------------------
+  !! COMPROBAR EL REPARTO ANTES DE DAR POR BUENA UNA CORRIDA "C"
+  ---------------------------------------------------------------------
+
+  Apuntar "enqueued" de las dos ANTES y DESPUES. La diferencia es lo que
+  proceso cada una:
+
+    for ip in 172.31.84.127 172.31.86.199; do
+      echo -n "$ip  "; curl -s http://$ip/api/v1/metrics |
+        grep -o '"enqueued":[0-9]*'
+    done
+
+  Si una de las dos se queda en cero, ESA CORRIDA NO ES UNA "C": es una
+  "B" disfrazada. Repetirla (el hash de flujo del NLB es aleatorio) o
+  subir N. Anotar el reparto real en NOTAS.md: es un dato del informe,
+  no un detalle.
+
+  Durante el pico, en otra terminal del generador, en vivo:
 
     watch -n 2 'for ip in 172.31.84.127 172.31.86.199; do
                   echo -n "$ip  "
@@ -386,6 +490,22 @@ Donde se ejecuta cada cosa:
                   echo
                 done'
 
+  ---------------------------------------------------------------------
+  !! COMO SE JUNTAN LOS N RESULTADOS (trampa facil)
+  ---------------------------------------------------------------------
+
+  LOS PERCENTILES NO SE PROMEDIAN. La media de seis p99 no es el p99 del
+  sistema, y ponerla en el informe es un error de metodo.
+
+  Lo correcto y defendible con lo que imprime el loadtest:
+    - throughput y n: SI se suman entre los N contenedores
+    - fallidas: se suman
+    - p50/p95/p99: se reporta el PEOR de los N (cota superior conservadora)
+      y, si se quiere, el rango min-max entre contenedores
+
+  Sacar el peor p99 de compra de una corrida:
+
+    grep -h '^  BUY' 1-normal-*.txt | sed 's/.*p99=\([0-9.]*\)ms.*/\1/' | sort -g | tail -1
 
 ---------------------------------------------------------------------
 7. CERRAR LA CORRIDA                                      [EC2 generador]
@@ -402,7 +522,10 @@ Donde se ejecuta cada cosa:
 
 cat > NOTAS.md <<EOF
 Corrida: $RUN
-Variante: A (2 targets)
+Configuracion: C   (A = directo | B = NLB 1 target | C = NLB 2 targets)
+Contenedores en paralelo (N):
+Reparto real  enqueued original / replica:
+Peor p99 compra / venta entre los N:
 Motor encendido desde: (hora)
 Quien ejecuto:
 Observaciones (errores, cosas raras, lo que se vio en el watch):
@@ -415,26 +538,37 @@ EOF
 
 
 ---------------------------------------------------------------------
-8. VARIANTE B: UN SOLO TARGET                                    [MAC]
+8. CAMBIAR DE CONFIGURACION                                      [MAC]
 ---------------------------------------------------------------------
 
-  No hay que desmontar nada. Se saca la replica del balanceador, se
-  repite desde el paso 4 con una carpeta nueva (Variante: B (1 target)
-  en las notas), y al terminar se vuelve a meter.
+  No hay que desmontar nada, ni crear nada. Las tres configuraciones se
+  recorren cambiando la URL del generador y, para B, desregistrando un
+  target. Coste extra en AWS: CERO.
+
+  C (NLB, 2 targets) -> B (NLB, 1 target):
 
     export AWS_PROFILE=arquisoft
     TG=arn:aws:elasticloadbalancing:us-east-1:660360494821:targetgroup/trading-tg-80/d7601f5555d27d04
 
     aws elbv2 deregister-targets --target-group-arn $TG --targets Id=i-0355dc1e06f770749
-    # ... corridas de B (pasos 4 a 7) ...
+    # ... corridas de B (pasos 4 a 7), con URL=$NLB ...
     aws elbv2 register-targets   --target-group-arn $TG --targets Id=i-0355dc1e06f770749
 
+  A (directo, sin balanceador): no toca AWS en absoluto. Solo se cambia la
+  URL de las corridas del paso 6:
+
+    URL=http://172.31.84.127
+
   La replica sale del balanceador pero SIGUE ENCENDIDA y con su API viva.
-  No la apagues: al volver a encenderla podria abrir una sesion nueva y
+  No apagarla: al volver a encenderla podria abrir una sesion nueva y
   habria que rehacer el paso 3.
 
-  Esperar a que el target vuelva a "healthy" (comando del paso 2) antes
-  de otra corrida de A.
+  Esperar a que el target vuelva a "healthy" (comando del paso 2) antes de
+  otra corrida de C.
+
+  Una carpeta del paso 4 por configuracion, y en NOTAS.md la linea
+  "Configuracion: A | B | C" con el mismo criterio que INFRA.md. NO usar
+  "variante A/B" con otro significado: A es DIRECTO, no "dos targets".
 
 
 ---------------------------------------------------------------------
@@ -538,8 +672,15 @@ EOF
 
   ssh se queda colgado y expira
     -> IP publica vieja, o puerto 22 cerrado para tu IP. Repetir paso 2.
+  "Please login as the user ec2-user rather than the user root"
+    -> se uso root@. Amazon Linux bloquea root a proposito. Repetir con
+       ec2-user@ delante de la IP. El usuario es ec2-user en las CUATRO
+       maquinas (Amazon Linux 2023); nunca root, nunca ubuntu, nunca admin.
   Permission denied (publickey)
-    -> permisos del .pem o llave equivocada: chmod 400 ~/.ssh/Arquisoft.pem
+    -> permisos del .pem, llave equivocada, o el .pem no esta en el
+       directorio desde el que lanzas el ssh (si usas -i "Arquisoft.pem"
+       sin ruta, tienes que estar en su carpeta). Arreglo estable:
+       mv Arquisoft.pem ~/.ssh/ && chmod 400 ~/.ssh/Arquisoft.pem
   El DNS del NLB no resuelve o no responde desde el Mac
     -> es lo esperado: el NLB es interno. Solo se alcanza desde la VPC,
        o sea desde el generador. Ver el aviso del paso 0.
