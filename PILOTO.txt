@@ -204,8 +204,38 @@ Donde se ejecuta cada cosa:
       {"ordenesEnCompra":0,"ordenesEnVenta":0,"tradesEmparejados":0,
        "ultimaOrdenRecibida":0,"ordenesProcesadasTotales":0}
 
-  O sea: hoy el piloto NO se puede medir tal cual esta. Primero el arreglo
-  de arriba (la orden + el reinicio), y no seguir hasta que los dos ids
+  QUE SE ROMPE EXACTAMENTE, si se mide con las sesiones partidas:
+
+    Las LATENCIAS si valen. El camino de una orden es persistir, inyectar
+    al motor y responder: no cruza sesiones. El p99 de compra y venta
+    mediria lo que dice medir, y el motor tampoco se entera (su contador
+    es global y cada instancia ve una subsecuencia creciente, asi que no
+    hay rotaciones espurias).
+
+    Lo que se corrompe es TODO LO DEMAS, y en silencio. El bridge es
+    singleton y publica en su API local, asi que todos los trades entran
+    por la original y se sellan con la sesion de la original. El
+    TradeEvent solo trae dos ids de orden, y el backend reconstruye lo
+    demas cruzando contra las ordenes DE ESA SESION
+    (src/services/persistence.js, findByEngineIds). Cuando el motor
+    empareja una compra de una instancia contra una venta de la otra, una
+    pata esta en la otra sesion y no aparece.
+
+    El trade se guarda igual -- hay un comentario explicito de que nunca
+    se pierde el hecho economico -- pero con la mitad de los campos en
+    null: buyOrderId/sellOrderId, buyerUserId/sellerUserId, y assetId si
+    fallan las dos patas. No hay error en los logs. Consecuencias:
+      - las ordenes de la otra instancia se quedan en ACCEPTED para
+        siempre, con filledQuantity en 0
+      - esos usuarios no mueven posicion ni caja
+      - reconcile (paso 7) compara el libro del motor contra las ordenes
+        de SU sesion: media libro caeria en "unknownToBackend", asi que
+        reconcile.json sale inservible como evidencia
+    Con reparto ~50/50, cerca de la mitad de las patas se pierden asi.
+
+  Conclusion: se podria medir latencia hoy, pero la evidencia de
+  correctitud seria basura silenciosa. Como es medio informe, no compensa:
+  el arreglo de arriba son dos minutos. No seguir hasta que los dos ids
   coincidan.
 
   Por que funciona: al arrancar, un backend reanuda la sesion abierta en la

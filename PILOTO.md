@@ -203,8 +203,29 @@ Esperar 30 s y volver a comparar.
 > Y el motor está en frío, que es justo la causa —
 > `curl -s http://172.31.21.117:8080/api/estadisticas` devuelve
 > `{"ordenesEnCompra":0,"ordenesEnVenta":0,"tradesEmparejados":0,"ultimaOrdenRecibida":0,"ordenesProcesadasTotales":0}`.
-> Hoy el piloto **no se puede medir tal cual está**: primero el arreglo de
-> arriba, y no seguir hasta que los dos ids coincidan.
+> **Qué se rompe exactamente.** Las **latencias sí valen**: el camino de una
+> orden es persistir, inyectar al motor y responder, y no cruza sesiones (el
+> contador del motor es global y cada instancia ve una subsecuencia creciente,
+> así que tampoco hay rotaciones espurias).
+>
+> Lo que se corrompe es todo lo demás, y en silencio. El bridge es singleton y
+> publica en su API local, así que **todos** los trades entran por la original y
+> se sellan con la sesión de la original. El `TradeEvent` solo trae dos ids de
+> orden y el backend reconstruye lo demás cruzando contra las órdenes **de esa
+> sesión** (`findByEngineIds` en `src/services/persistence.js`). Si el motor
+> empareja una compra de una instancia contra una venta de la otra, esa pata no
+> aparece.
+>
+> El trade **se guarda igual** —nunca se pierde el hecho económico— pero con la
+> mitad de los campos en `null`, y sin un solo error en los logs. Resultado: las
+> órdenes de la otra instancia se quedan en `ACCEPTED` con `filledQuantity` 0,
+> esos usuarios no mueven posición ni caja, y `reconcile` (paso 7) mete medio
+> libro en `unknownToBackend`, así que `reconcile.json` sale inservible como
+> evidencia. Con reparto ~50/50 se pierde cerca de la mitad de las patas.
+>
+> Se podría medir latencia hoy, pero la evidencia de correctitud sería basura
+> silenciosa. El arreglo son dos minutos: no seguir hasta que los dos ids
+> coincidan.
 
 Por qué funciona: al arrancar, un backend reanuda la sesión abierta en la RDS
 solo si comprueba que el motor conserva su libro. Con el motor recién encendido
