@@ -53,6 +53,97 @@ El ratio 0,34 depende del solape de precios, así que **hay que verificarlo en
 cada corrida** (ver *Comprobar los emparejamientos logrados*). Si sale distinto,
 se ajusta la tasa y se anota.
 
+## Puesta a cero (antes de la primera corrida que cuente)
+
+Deja base, motor y logs sin rastro de las corridas de depuración. **Se ejecuta
+con la carga parada**, y el orden importa.
+
+> **Por qué no basta con vaciar y reiniciar.** Con el motor en frío y los dos
+> backends arriba, el segundo en arrancar no puede distinguir "motor recién
+> reiniciado" de "motor que perdió su libro", así que abre sesión nueva y cierra
+> la del otro: split-brain garantizado. Por eso hay que **inyectar una orden por
+> la instancia cuya sesión quede ABIERTA** y reiniciar la otra. Esa orden es el
+> único residuo, y al vivir en la sesión activa `reconcile` la resuelve sin
+> marcarla como `unknownToBackend` (a diferencia de la del 2026-09-05, que cayó
+> en una sesión cerrada).
+
+**1 — Vaciar la base** · en la EC2 **original** (`~/persistencia-traiding`):
+
+```bash
+docker compose exec -T api node -e "
+import('file:///app/src/db/pool.js').then(async ({ pool }) => {
+  await pool.query('TRUNCATE trades, orders, positions, engine_sessions, users RESTART IDENTITY');
+  const { rows: [r] } = await pool.query(
+    'SELECT (SELECT count(*) FROM orders) orders, (SELECT count(*) FROM trades) trades,'
+    + ' (SELECT count(*) FROM engine_sessions) sessions, (SELECT count(*) FROM users) users,'
+    + ' (SELECT count(*) FROM assets) assets');
+  console.log(r); await pool.end();
+});"
+```
+
+Tiene que imprimir todo a `0` salvo `assets: 5` — los activos son datos de
+referencia sembrados por la migración `002` y **no se tocan**, igual que
+`schema_migrations`.
+
+**2 — Vaciar el motor y los dead-letter**:
+
+```bash
+curl -s -X POST http://172.31.84.127/api/v1/engine/reset      # NUNCA /api/reset del motor
+docker compose exec -T api sh -c 'rm -f /app/logs/dead-letter.ndjson'
+```
+
+Y lo mismo en la **réplica** (`ssh` a su IP pública, `cd ~/persistencia-traiding`):
+
+```bash
+docker compose exec -T api sh -c 'rm -f /app/logs/dead-letter.ndjson'
+```
+
+**3 — Reiniciar los dos backends**, uno después del otro (nunca a la vez):
+
+```bash
+docker compose restart api      # en la original; esperar a que /ready dé 200
+docker compose restart api      # después, en la réplica
+```
+
+**4 — Converger las sesiones.** Mirar cuál quedó **abierta**:
+
+```bash
+curl -s http://172.31.84.127/api/v1/sessions | head -20     # ended_at: null = abierta
+```
+
+Inyectar **una** orden por la instancia dueña de esa sesión abierta, y reiniciar
+**la otra**:
+
+```bash
+curl -s -X POST http://<ip-de-la-instancia-con-la-sesion-ABIERTA>/api/v1/orders/sell \
+  -H 'Content-Type: application/json' -d '{"userId":1,"assetId":2,"price":999,"quantity":1}'
+
+# y en la OTRA máquina:
+docker compose restart api
+```
+
+**5 — Verificar** antes de medir:
+
+```bash
+curl -s http://172.31.84.127/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+curl -s http://172.31.86.199/api/v1/status | grep -o '"session":{"id":"[^"]*"'
+curl -s http://172.31.84.127/api/v1/status | python3 -m json.tool | grep -A6 '"counts"'
+curl -s http://172.31.21.117:8080/api/estadisticas
+```
+
+Estado correcto para arrancar: **los dos ids iguales**, `orders: 1`, `trades: 0`,
+una sola sesión, y el motor con `ordenesProcesadasTotales: 1` y una venta en el
+libro. Esa venta a 999 nunca cruza (el `loadtest` opera entre 50 y 70), así que
+no altera ninguna medida.
+
+**6 — Limpiar resultados viejos** · en el **generador**, si no quieres mezclarlos
+con los buenos (bájalos antes si te sirven de algo):
+
+```bash
+ls ~/results/          # mirar qué hay ANTES de borrar
+rm -rf ~/results/*
+```
+
 ## Antes de empezar
 
 ```bash
