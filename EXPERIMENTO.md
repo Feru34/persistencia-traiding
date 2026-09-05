@@ -322,3 +322,25 @@ docker compose up -d --force-recreate api
 ```
 
 Checklist de cierre de `PENDIENTES.md` §8: **6 de 6** ✅.
+
+---
+
+## 11. Escalabilidad horizontal: balanceador de carga (NLB)
+
+Extensión del experimento: el backend replicado detrás de un Network Load
+Balancer, para separar dos preguntas que el reto mezcla — cuánto mejora la
+latencia al escalar el gateway, y hasta dónde se puede escalar antes de chocar
+contra el motor, que es el componente con estado.
+
+El montaje completo (por qué NLB y no ALB, las tres configuraciones A/B/C, la
+plantilla de CloudFormation paso a paso, el análisis de qué aguanta el diseño
+con dos backends contra un motor, costos y desmontaje) está en
+**[INFRA.md § Escalabilidad horizontal](INFRA.md#escalabilidad-horizontal-balanceador-de-carga-nlb)**.
+
+Resultados a rellenar al medir:
+
+| Config | Venta p99 (< 500 ms) | Compra p99 (< 300 ms) | Throughput | Fallidas |
+|---|---|---|---|---|
+| A — directo, sin LB | | | | |
+| B — NLB, 1 target | | | | |
+| C — NLB, 2 targets | | | | |

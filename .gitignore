@@ -45,7 +45,8 @@ application.properties
 # ---------------------------------------------------------------------------
 # Instrucciones para agentes de IA — locales, no se comparten
 # ---------------------------------------------------------------------------
-CLAUDE.md
+# CLAUDE.md sí se versiona: lleva el mapa de la documentación y las
+# invariantes del dominio, y tiene que viajar con el repo.
 .claude/
 
 # ---------------------------------------------------------------------------

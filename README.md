@@ -30,6 +30,7 @@ posiciones y las comisiones.
 - [Resultados de carga](#resultados-de-carga)
 - [Despliegue en AWS y experimento](#despliegue-en-aws-y-experimento)
 - [Operación](#operación)
+- [Infraestructura y despliegue en AWS → INFRA.md](INFRA.md)
 - [Pruebas](#pruebas)
 
 ---
@@ -276,6 +277,37 @@ docker compose --profile engine down
 
 También como scripts: `npm run docker:up`, `docker:up:engine`, `docker:logs`,
 `docker:down`.
+
+### Publicar en el puerto 80
+
+En el despliegue de AWS el backend escucha en el **80**, para que los endpoints
+sean `http://IP/api/v1/...` sin puerto en la URL. Dos variables en `.env`:
+
+```bash
+PORT_DOCKER=80   # puerto DENTRO del contenedor
+PORT_HOST=80     # puerto publicado en el host
+```
+
+El proceso de Node corre como usuario sin privilegios y aun así puede abrir el
+80 porque Docker fija `net.ipv4.ip_unprivileged_port_start=0` dentro del
+contenedor. El `HEALTHCHECK` de la imagen y el `BRIDGE_TARGET_URL` interno
+siguen a `PORT_DOCKER`, así que no hay nada más que tocar. Fuera de Docker
+(`npm start`) manda `PORT`, que sigue en 3000: un puerto bajo exigiría root.
+
+### Replicar el backend: un solo bridge
+
+Si el backend se pone detrás de un balanceador, las réplicas deben arrancar
+**sin** el worker:
+
+```bash
+BRIDGE_REPLICAS=0    # en el .env de cada réplica
+```
+
+El motor publica los trades por WebSocket en *broadcast*: dos bridges reciben
+cada trade dos veces. No se corrompe nada (el índice único los descarta), pero
+es trabajo duplicado y las métricas dejan de cuadrar. El valor por defecto es 1,
+así que el stack de siempre no cambia. El montaje completo está en
+[EXPERIMENTO.md §11](EXPERIMENTO.md).
 
 ### Contra la RDS real
 
@@ -595,6 +627,15 @@ curl -X POST 'localhost:3000/api/v1/admin/reconcile?repair=true'
 # Reprocesar lotes que no se pudieron escribir
 node scripts/replay-dead-letter.js
 ```
+
+> Esos `curl` usan el puerto 3000, que es el de `npm start` en local. En el
+> despliegue con Docker y `PORT_HOST=80` la URL es `localhost` sin puerto.
+
+### Operar en AWS
+
+Dónde se ejecuta cada comando, el procedimiento de medición, cómo dejar el
+entorno limpio y cómo verificar desde el navegador que las dos instancias están
+arriba: todo está en **[INFRA.md](INFRA.md)**.
 
 ### Despliegue
 

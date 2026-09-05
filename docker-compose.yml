@@ -75,8 +75,13 @@ services:
       ENGINE_BASE_URL: ${ENGINE_BASE_URL_DOCKER:-http://engine:8080}
       NODE_ENV: ${NODE_ENV:-production}
       HOST: 0.0.0.0
+      # Puerto DENTRO del contenedor. Con PORT_DOCKER=80 el proceso escucha
+      # directamente en el 80 y el 3000 desaparece del despliegue. El usuario
+      # `node` puede abrirlo porque Docker fija
+      # net.ipv4.ip_unprivileged_port_start=0 dentro del contenedor.
+      PORT: ${PORT_DOCKER:-3000}
     ports:
-      - "${PORT_HOST:-3000}:3000"
+      - "${PORT_HOST:-3000}:${PORT_DOCKER:-3000}"
     volumes:
       # Los lotes que no se pudieron escribir (dead letter) sobreviven al
       # reinicio del contenedor y se pueden reprocesar.
@@ -109,9 +114,17 @@ services:
       - .env
     environment:
       BRIDGE_ENGINE_WS_URL: ${BRIDGE_ENGINE_WS_URL_DOCKER:-ws://engine:8080/api/trades/stream}
-      BRIDGE_TARGET_URL: ${BRIDGE_TARGET_URL_DOCKER:-http://api:3000/api/v1/trades}
+      BRIDGE_TARGET_URL: ${BRIDGE_TARGET_URL_DOCKER:-http://api:${PORT_DOCKER:-3000}/api/v1/trades}
     command: ["node", "scripts/bridge.js"]
-    # El HEALTHCHECK de la imagen sondea el puerto 3000, que es del backend;
+    # Solo UNA instancia del stack debe correr el bridge. Si el backend se
+    # replica detrás de un balanceador, los clones van con BRIDGE_REPLICAS=0:
+    # dos bridges suscritos al mismo WebSocket reciben cada trade dos veces
+    # (el motor hace broadcast). No corrompe nada — el índice único
+    # (sesión, buyOrderId, sellOrderId) descarta el duplicado — pero es trabajo
+    # y ruido en las métricas por partida doble.
+    deploy:
+      replicas: ${BRIDGE_REPLICAS:-1}
+    # El HEALTHCHECK de la imagen sondea el puerto HTTP del backend;
     # el bridge no sirve HTTP y saldría siempre "unhealthy". Si su proceso
     # muere, tini termina y `restart: unless-stopped` lo vuelve a levantar,
     # así que no necesita otro chequeo.

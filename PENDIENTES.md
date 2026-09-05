@@ -1,8 +1,9 @@
 # PENDIENTES — despliegue en EC2 y experimentos de latencia
 
 > **Para quien lea esto (persona o Claude Code en la EC2):** este archivo es el
-> traspaso de contexto. `CLAUDE.md` no está versionado, así que aquí va lo
-> imprescindible. La referencia completa es el [README.md](README.md).
+> traspaso de contexto y las tareas abiertas. El mapa de la documentación está
+> en [CLAUDE.md](CLAUDE.md); la referencia del proyecto es el
+> [README.md](README.md) y el despliegue en AWS, [INFRA.md](INFRA.md).
 > Fecha del traspaso: 2026-09-04.
 
 ## 1. Qué es esto en cinco líneas

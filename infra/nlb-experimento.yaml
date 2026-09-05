@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  ARTI4109 Reto 1 - Montaje del experimento de escalabilidad: Network Load
+  Balancer interno, una réplica del backend de persistencia y una instancia
+  generadora de carga. Todo en una sola AZ, para que ni la latencia ni el
+  costo se vean afectados por el tráfico entre zonas.
+
+  Se borra entero con: aws cloudformation delete-stack --stack-name trading-nlb
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde ya viven las EC2 (la default, 172.31.0.0/16)
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Subred de la MISMA AZ en la que está la EC2 de persistencia. Una sola:
+      con AZ única no hay transferencia entre zonas que pagar ni salto de red
+      que ensucie los percentiles.
+
+  VpcCidr:
+    Type: String
+    Default: 172.31.0.0/16
+    Description: >
+      Rango de la VPC. Se abre el puerto 80 desde aquí para que lleguen los
+      health checks del NLB y el tráfico del generador.
+
+  BackendSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >
+      El SG que ya usa la EC2 de persistencia. La réplica nace con el mismo,
+      así hereda los permisos hacia el motor (8080) y la RDS (5432) sin
+      tocar nada — siempre que esas reglas usen el SG como origen y no una IP.
+
+  BackendAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI creada a partir de la EC2 de persistencia ya configurada
+
+  ExistingBackendInstanceId:
+    Type: String
+    Description: id de la EC2 de persistencia original (i-0...), el primer target
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Par de llaves para poder entrar por SSH a las instancias nuevas
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Mismo tipo que la original; la simetría entre nodos es lo que hace comparable la medida
+
+Resources:
+
+  # El puerto 80 tiene que aceptar tráfico de dentro de la VPC: el NLB manda
+  # los health checks desde IPs privadas de la subred, y el generador llega con
+  # su IP real (el NLB preserva la IP del cliente, no la enmascara).
+  BackendPort80FromVpc:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref VpcCidr
+      Description: HTTP desde la VPC (health checks del NLB y generador de carga)
+
+  # Réplica del backend. Arranca sin bridge: el motor emite los trades por
+  # broadcast, así que un segundo worker recibiría cada trade por duplicado.
+  BackendReplica:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BackendAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref BackendSecurityGroupId]
+      Tags:
+        - Key: Name
+          Value: trading-persistencia-replica
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          cd /home/ec2-user/persistencia-traiding || exit 0
+          # La imagen trae los contenedores con restart=unless-stopped, así que
+          # el bridge arranca solo al encender. Se quita antes de nada.
+          docker rm -f trading-bridge 2>/dev/null
+          sed -i '/^BRIDGE_REPLICAS=/d' .env
+          echo 'BRIDGE_REPLICAS=0' >> .env
+          runuser -l ec2-user -c 'cd ~/persistencia-traiding && docker compose up -d'
+
+  # Genera la carga. No levanta el stack: usa la imagen que ya trae la AMI
+  # para correr scripts/loadtest.js en un contenedor suelto.
+  LoadGenerator:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BackendAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref BackendSecurityGroupId]
+      Tags:
+        - Key: Name
+          Value: trading-generador-carga
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -x
+          cd /home/ec2-user/persistencia-traiding || exit 0
+          # Que no sirva tráfico ni escriba en la RDS: solo genera carga.
+          docker rm -f trading-api trading-bridge trading-postgres 2>/dev/null
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: trading-tg-80
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 80
+      TargetType: instance
+      # /ready devuelve 503 SOLO si la RDS no responde. Un motor caído no saca
+      # la instancia del balanceo: las consultas y la persistencia siguen vivas.
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /api/v1/ready
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '10'
+      Targets:
+        - Id: !Ref ExistingBackendInstanceId
+        - Id: !Ref BackendReplica
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: trading-nlb
+      Type: network
+      # Interno: un NLB internet-facing asigna una IPv4 pública por AZ, y cada
+      # IPv4 pública se factura por hora. El generador vive en la VPC.
+      Scheme: internal
+      Subnets: [!Ref SubnetId]
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  LoadBalancerDns:
+    Description: A esto apunta el generador con --url
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+
+  GeneratorInstanceId:
+    Description: Instancia desde la que se lanza la carga
+    Value: !Ref LoadGenerator
+
+  ReplicaPrivateIp:
+    Description: IP privada de la réplica, para consultar sus /metrics por separado
+    Value: !GetAtt BackendReplica.PrivateIp
+
+  TargetGroupArn:
+    Description: Para desregistrar la réplica y medir la configuración B (NLB con 1 solo target)
+    Value: !Ref TargetGroup
