@@ -24,7 +24,7 @@ Ojo con la Prueba 2: el enunciado pide el pico en **emparejamientos**, no en
 | 1 | Registro de **venta**: p99 < 500 ms | Enunciado |
 | 2 | Registro de **compra**: p99 < 300 ms | Enunciado |
 | 3 | **p95 < 100 ms** y **p99 < 200 ms** | Criterio estricto del curso |
-| 4 | Recuperación tras el pico ≤ 5 min | Criterio del curso |
+| 4 | Recuperación tras el pico ≤ **3 min** | Enunciado, Exp. 1 |
 | 5 | **0 órdenes perdidas**: `dropped: 0`, `deadLettered: 0`, cola de vuelta a 0 | Integridad |
 | 6 | `reconcile.json` sin deriva contra el libro del motor | Integridad |
 

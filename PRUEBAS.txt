@@ -38,7 +38,7 @@ CRITERIOS DE ACEPTACION
   1  Registro de VENTA   p99 < 500 ms                    (enunciado)
   2  Registro de COMPRA  p99 < 300 ms                    (enunciado)
   3  p95 < 100 ms  Y  p99 < 200 ms                       (criterio estricto)
-  4  Recuperacion tras el pico <= 5 min                  (criterio del curso)
+  4  Recuperacion tras el pico <= 3 min                  (enunciado, Exp 1)
   5  Cero perdidas: dropped 0, deadLettered 0, cola a 0  (integridad)
   6  reconcile.json sin deriva contra el libro del motor (integridad)
 

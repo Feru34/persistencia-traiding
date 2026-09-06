@@ -7,6 +7,16 @@
  * Uso:
  *   node scripts/loadtest.js --orders 2000 --concurrency 50
  *   node scripts/loadtest.js --rate 1300 --duration 60   (órdenes/min durante N s)
+ *
+ * Opciones del enunciado (sin ellas, el comportamiento no cambia):
+ *   --hotAssets 0,1     concentra la carga en esos activos ("activos calientes":
+ *                       todo el mundo opera la misma acción a la vez, que es lo
+ *                       que produce contención sobre un único libro de órdenes)
+ *   --hotShare 0.8      fracción de órdenes que va a los calientes (por defecto
+ *                       0.8 cuando se pasa --hotAssets)
+ *   --arrivals poisson  llegadas con espera exponencial en vez de intervalo fijo.
+ *                       El metrónomo de setInterval no forma colas; las ráfagas
+ *                       de un proceso de Poisson sí, y es lo que ocurre de verdad.
  */
 import 'dotenv/config';
 
@@ -22,6 +32,52 @@ const RATE_PER_MIN = args.has('rate') ? Number(args.get('rate')) : null;
 const DURATION_S = Number(args.get('duration') || 60);
 const ASSETS = Number(process.env.ASSET_COUNT || 5);
 
+// --- Activos calientes -----------------------------------------------------
+const HOT_ASSETS = String(args.get('hotAssets') ?? '')
+  .split(',').map((x) => x.trim()).filter(Boolean).map(Number);
+for (const a of HOT_ASSETS) {
+  if (!Number.isInteger(a) || a < 0 || a >= ASSETS) {
+    console.error(`--hotAssets: ${a} no es un activo válido (0..${ASSETS - 1})`);
+    process.exit(1);
+  }
+}
+// Los que NO son calientes. Se elige de esta lista en la rama fría para que la
+// proporción pedida se cumpla exacta y no se infle por azar.
+const COLD_ASSETS = Array.from({ length: ASSETS }, (_, i) => i).filter((i) => !HOT_ASSETS.includes(i));
+const HOT_SHARE = args.has('hotShare') ? Number(args.get('hotShare')) : (HOT_ASSETS.length ? 0.8 : 0);
+if (!(HOT_SHARE >= 0 && HOT_SHARE <= 1)) {
+  console.error('--hotShare debe estar entre 0 y 1');
+  process.exit(1);
+}
+
+// --- Llegadas --------------------------------------------------------------
+const ARRIVALS = String(args.get('arrivals') ?? 'fixed').toLowerCase();
+if (!['fixed', 'poisson'].includes(ARRIVALS)) {
+  console.error(`--arrivals inválido: "${ARRIVALS}". Usa "fixed" o "poisson".`);
+  process.exit(1);
+}
+
+/**
+ * Un activo, sesgado hacia los calientes si se pidieron.
+ * Sin --hotAssets, COLD_ASSETS son todos y HOT_SHARE es 0: reparto uniforme,
+ * exactamente como antes.
+ */
+const pickAsset = () => {
+  if (HOT_ASSETS.length > 0 && Math.random() < HOT_SHARE) {
+    return HOT_ASSETS[Math.floor(Math.random() * HOT_ASSETS.length)];
+  }
+  const pool = COLD_ASSETS.length > 0 ? COLD_ASSETS : HOT_ASSETS;
+  return pool[Math.floor(Math.random() * pool.length)];
+};
+
+/**
+ * Espera hasta la siguiente llegada de un proceso de Poisson de media
+ * `meanMs`: -ln(U) · media, con U uniforme en (0,1]. La media coincide con el
+ * intervalo fijo equivalente, así que la TASA es la misma; lo que cambia es que
+ * las llegadas se agrupan en ráfagas en vez de ir acompasadas.
+ */
+const exponentialDelay = (meanMs) => -Math.log(1 - Math.random()) * meanMs;
+
 const latencies = { BUY: [], SELL: [] };
 const errors = new Map();
 let ok = 0;
@@ -33,7 +89,7 @@ const randomOrder = () => {
     side,
     body: {
       userId: 1 + Math.floor(Math.random() * 4),
-      assetId: Math.floor(Math.random() * ASSETS),
+      assetId: pickAsset(),
       price: Number((50 + Math.random() * 20).toFixed(2)),
       quantity: 1 + Math.floor(Math.random() * 50),
     },
@@ -102,16 +158,43 @@ function report(elapsedS) {
 const started = performance.now();
 
 if (RATE_PER_MIN) {
-  // Carga a tasa constante: mide latencia en régimen estable.
+  // Carga a tasa objetivo: mide latencia en régimen estable.
   const intervalMs = 60_000 / RATE_PER_MIN;
-  console.log(`Enviando ${RATE_PER_MIN} órdenes/min durante ${DURATION_S}s hacia ${BASE}...`);
+  const perfil = ARRIVALS === 'poisson' ? 'Poisson' : 'intervalo fijo';
+  const calientes = HOT_ASSETS.length
+    ? `, activos calientes [${HOT_ASSETS}] al ${(HOT_SHARE * 100).toFixed(0)}%`
+    : '';
+  console.log(
+    `Enviando ${RATE_PER_MIN} órdenes/min durante ${DURATION_S}s hacia ${BASE}`
+    + ` (llegadas: ${perfil}${calientes})...`,
+  );
+
   const inflight = new Set();
-  const timer = setInterval(() => {
+  const dispatch = () => {
     const p = sendOne().finally(() => inflight.delete(p));
     inflight.add(p);
-  }, intervalMs);
+  };
+
+  let stop;
+  if (ARRIVALS === 'poisson') {
+    // Espera exponencial: cada llegada se reprograma con su propio retardo, así
+    // que el tiempo entre órdenes varía y se forman ráfagas. setInterval no
+    // sirve aquí porque su periodo es constante por definición.
+    let timer = null;
+    let parado = false;
+    const next = () => {
+      if (parado) return;
+      timer = setTimeout(() => { dispatch(); next(); }, exponentialDelay(intervalMs));
+    };
+    next();
+    stop = () => { parado = true; clearTimeout(timer); };
+  } else {
+    const timer = setInterval(dispatch, intervalMs);
+    stop = () => clearInterval(timer);
+  }
+
   setTimeout(async () => {
-    clearInterval(timer);
+    stop();
     await Promise.allSettled([...inflight]);
     report((performance.now() - started) / 1000);
     process.exit(0);
